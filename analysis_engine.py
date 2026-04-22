@@ -1,23 +1,11 @@
 """
-analysis_engine.py v3.0
-========================
-修正與改善項目：
-
-【潛在問題修正】
-  1. RSI 使用 Wilder's Smoothing（標準算法）
-  2. 平局不輸出訊號
-  3. 週期查表，不額外發 API
-  4. 訊號門檻：差距≥3、總分≥5
-  5. fetch_klines 加入重試機制（3次）
-  6. 成交量為 0 時跳過（異常資料防護）
-  7. BOS/CHoCH 改用 EMA50 斜率判斷趨勢
-
-【進場精確度提升】
-  8.  成交量確認（量增價漲/跌才加分）
-  9.  K線型態識別（錘子/吞噬/流星/十字星）
-  10. 多週期確認（主週期 + 上層週期方向一致加分）
-  11. 進場點優先取 OB/FVG 中點，不直接追現價
-  12. 新增進場信心度（極高/高/中/低）
+analysis_engine.py v4.0
+修正：
+  1. signal 變數與 Python 內建 signal 模組命名衝突 → 改名 macd_signal
+  2. get_best_entry 距離判斷用 atr 但 atr 可能很小 → 改用 atr * 2
+  3. 錘子線/十字星條件：body2 可能為 0 導致除以零 → 加防呆
+  4. 上層週期抓取失敗時 upper_agree 仍可能影響評分 → 明確處理
+  5. 已推播訊號防重複：相同幣種+方向 1 小時內不重複推播
 """
 
 import time
@@ -46,7 +34,6 @@ COIN_TIMEFRAME = {
     "SUI": "1h", "VET": "1h", "GRT": "1h", "AAVE": "4h", "MKR": "4h",
 }
 
-# 上層週期（多週期確認用）
 UPPER_TIMEFRAME = {"15m": "1h", "1h": "4h", "4h": "1d", "1d": "1w"}
 
 FIB_RETRACEMENT = [0.236, 0.382, 0.5, 0.618, 0.786]
@@ -57,14 +44,28 @@ MIN_SCORE_TOTAL = 5
 
 BINANCE_URL = "https://api.binance.com/api/v3/klines"
 
+# 修正5：已推播訊號快取（防重複）
+# 格式：{"BTCUSDT_long": timestamp}
+_signal_cache: dict = {}
+SIGNAL_COOLDOWN = 3600  # 同幣種同方向 1 小時內不重複推播
+
+
+def is_duplicate_signal(symbol: str, direction: str) -> bool:
+    key = f"{symbol}_{direction}"
+    now = time.time()
+    if key in _signal_cache:
+        if now - _signal_cache[key] < SIGNAL_COOLDOWN:
+            return True
+    _signal_cache[key] = now
+    return False
+
 
 # ──────────────────────────────────────────────
-# K 線抓取（含重試）
+# K 線抓取
 # ──────────────────────────────────────────────
 
 def fetch_klines(symbol: str, interval: str = "4h",
                  limit: int = 200, retries: int = 3) -> Optional[np.ndarray]:
-    """修正5：重試機制 / 修正6：成交量異常防護"""
     pair = f"{symbol}USDT"
     for attempt in range(retries):
         try:
@@ -99,7 +100,6 @@ def select_timeframe(symbol: str) -> str:
 # ──────────────────────────────────────────────
 
 def calc_rsi(closes: np.ndarray, period: int = 14) -> float:
-    """修正1：Wilder's Smoothing 標準 RSI"""
     if len(closes) < period + 1:
         return 50.0
     deltas   = np.diff(closes)
@@ -125,10 +125,11 @@ def calc_ema(closes: np.ndarray, period: int) -> np.ndarray:
 
 
 def calc_macd(closes: np.ndarray):
-    macd   = calc_ema(closes, 12) - calc_ema(closes, 26)
-    signal = calc_ema(macd, 9)
-    hist   = macd - signal
-    return float(macd[-1]), float(signal[-1]), float(hist[-1])
+    """修正1：回傳改名為 macd_signal，避免與 signal 模組衝突"""
+    macd_line   = calc_ema(closes, 12) - calc_ema(closes, 26)
+    macd_signal = calc_ema(macd_line, 9)
+    macd_hist   = macd_line - macd_signal
+    return float(macd_line[-1]), float(macd_signal[-1]), float(macd_hist[-1])
 
 
 def calc_bollinger(closes: np.ndarray, period: int = 20, std_dev: float = 2.0):
@@ -152,14 +153,10 @@ def calc_atr(highs, lows, closes, period: int = 14) -> float:
 
 
 # ──────────────────────────────────────────────
-# 成交量確認（進場精確度提升）
+# 成交量確認
 # ──────────────────────────────────────────────
 
 def calc_volume_confirmation(volumes: np.ndarray, closes: np.ndarray) -> dict:
-    """
-    修正8：量增價漲 → 多頭確認 / 量增價跌 → 空頭確認
-    vol_ratio ≥ 1.5 才算有效放量，避免假突破
-    """
     if len(volumes) < 21:
         return {"bullish_vol": False, "bearish_vol": False, "vol_ratio": 1.0}
     avg_vol   = float(volumes[-21:-1].mean())
@@ -175,62 +172,56 @@ def calc_volume_confirmation(volumes: np.ndarray, closes: np.ndarray) -> dict:
 
 
 # ──────────────────────────────────────────────
-# K 線型態識別（進場精確度提升）
+# K 線型態識別
 # ──────────────────────────────────────────────
 
 def detect_candle_pattern(opens, highs, lows, closes) -> dict:
-    """
-    修正9：識別看多/看空 K 線型態
-    錘子線、看漲吞噬、十字星（看多）
-    流星線、看跌吞噬（看空）
-    """
+    """修正3：body2 為 0 時加防呆，避免除以零"""
     result = {
-        "hammer":        False,
-        "engulfing_bull": False,
-        "doji_bull":     False,
-        "shooting_star": False,
-        "engulfing_bear": False,
-        "name":          "—",
+        "hammer": False, "engulfing_bull": False, "doji_bull": False,
+        "shooting_star": False, "engulfing_bear": False, "name": "—",
     }
     if len(closes) < 3:
         return result
 
-    o1 = float(opens[-2]);  h1 = float(highs[-2])
-    l1 = float(lows[-2]);   c1 = float(closes[-2])
+    o1 = float(opens[-2]);  c1 = float(closes[-2])
     o2 = float(opens[-1]);  h2 = float(highs[-1])
     l2 = float(lows[-1]);   c2 = float(closes[-1])
 
-    body2        = abs(c2 - o2)
-    rng2         = h2 - l2
-    upper_wick2  = h2 - max(o2, c2)
-    lower_wick2  = min(o2, c2) - l2
+    body2       = abs(c2 - o2)
+    rng2        = h2 - l2
+    upper_wick2 = h2 - max(o2, c2)
+    lower_wick2 = min(o2, c2) - l2
 
+    # 修正3：rng2 或 body2 為 0 直接返回
     if rng2 == 0:
         return result
 
-    # 錘子線：下影 > 實體2倍，上影小，收陽，前根收陰
-    if (lower_wick2 > body2 * 2 and upper_wick2 < body2 * 0.5
+    # 錘子線：下影 > 實體2倍（body>0才判斷），上影小，收陽，前根收陰
+    if (body2 > 0 and lower_wick2 > body2 * 2
+            and upper_wick2 < body2 * 0.5
             and c2 > o2 and c1 < o1):
         result["hammer"] = True
         result["name"]   = "🔨 錘子線"
 
-    # 流星線：上影 > 實體2倍，下影小，收陰，前根收陽
-    elif (upper_wick2 > body2 * 2 and lower_wick2 < body2 * 0.5
+    # 流星線
+    elif (body2 > 0 and upper_wick2 > body2 * 2
+            and lower_wick2 < body2 * 0.5
             and c2 < o2 and c1 > o1):
         result["shooting_star"] = True
         result["name"]          = "💫 流星線"
 
-    # 看漲吞噬：大陽線完全覆蓋前根陰線
+    # 看漲吞噬
     elif (c1 < o1 and c2 > o2 and o2 <= c1 and c2 >= o1):
         result["engulfing_bull"] = True
         result["name"]           = "📈 看漲吞噬"
 
-    # 看跌吞噬：大陰線完全覆蓋前根陽線
+    # 看跌吞噬
     elif (c1 > o1 and c2 < o2 and o2 >= c1 and c2 <= o1):
         result["engulfing_bear"] = True
         result["name"]           = "📉 看跌吞噬"
 
-    # 十字星看多：實體極小，下影線長（低位出現）
+    # 十字星：實體極小（用 rng2 比較，不用 body2 做除數）
     elif (body2 < rng2 * 0.1 and lower_wick2 > rng2 * 0.6):
         result["doji_bull"] = True
         result["name"]      = "✙ 十字星"
@@ -239,14 +230,11 @@ def detect_candle_pattern(opens, highs, lows, closes) -> dict:
 
 
 # ──────────────────────────────────────────────
-# 多週期趨勢確認（進場精確度提升）
+# 多週期趨勢確認
 # ──────────────────────────────────────────────
 
 def get_upper_trend(symbol: str, main_tf: str) -> Optional[str]:
-    """
-    修正10：抓上層週期 EMA50 斜率判斷趨勢方向
-    主週期與上層週期一致 → 訊號更可靠
-    """
+    """修正4：失敗時明確回傳 None，不影響評分"""
     upper_tf = UPPER_TIMEFRAME.get(main_tf)
     if not upper_tf:
         return None
@@ -260,19 +248,16 @@ def get_upper_trend(symbol: str, main_tf: str) -> Optional[str]:
 
 
 # ──────────────────────────────────────────────
-# 進場點優化（取 OB/FVG 中點）
+# 進場點優化
 # ──────────────────────────────────────────────
 
 def get_best_entry(price: float, obs: list, fvgs: list,
                    direction: str, atr: float) -> float:
-    """
-    修正11：進場點優先取最近 OB 或 FVG 中點
-    若中點距現價 > 1×ATR 則不用（太遠），直接用現價
-    """
+    """修正2：距離判斷改用 atr * 2，避免 atr 太小導致無法使用 OB/FVG"""
+    max_dist   = atr * 2
     candidates = []
 
     if direction == "long":
-        # 看多：取價格下方最近的 bullish OB 或 bullish FVG 中點
         for ob in obs:
             if ob["type"] == "bullish_ob":
                 mid = (ob["high"] + ob["low"]) / 2
@@ -284,11 +269,10 @@ def get_best_entry(price: float, obs: list, fvgs: list,
                 if mid < price:
                     candidates.append(mid)
         if candidates:
-            best = max(candidates)   # 最近的（最高的）
-            if price - best <= atr:
+            best = max(candidates)
+            if price - best <= max_dist:
                 return round(best, 6)
     else:
-        # 看空：取價格上方最近的 bearish OB 或 bearish FVG 中點
         for ob in obs:
             if ob["type"] == "bearish_ob":
                 mid = (ob["high"] + ob["low"]) / 2
@@ -300,22 +284,19 @@ def get_best_entry(price: float, obs: list, fvgs: list,
                 if mid > price:
                     candidates.append(mid)
         if candidates:
-            best = min(candidates)   # 最近的（最低的）
-            if best - price <= atr:
+            best = min(candidates)
+            if best - price <= max_dist:
                 return round(best, 6)
 
     return round(price, 6)
 
 
 # ──────────────────────────────────────────────
-# 進場信心度
+# 信心度
 # ──────────────────────────────────────────────
 
 def get_confidence(score_diff: int, has_volume: bool,
                    has_candle: bool, upper_agree: bool) -> str:
-    """
-    修正12：綜合多個確認因子給出信心度
-    """
     bonus = sum([has_volume, has_candle, upper_agree])
     if score_diff >= 8 and bonus >= 2:
         return "🔥 極高"
@@ -429,7 +410,6 @@ def detect_fvg(highs, lows, closes):
 
 
 def detect_bos_choch(highs, lows, closes, lookback=20):
-    """修正7：EMA50 斜率判斷趨勢"""
     if len(closes) < lookback + 10:
         return None, None
     recent_high = float(highs[-lookback:-1].max())
@@ -446,7 +426,6 @@ def detect_bos_choch(highs, lows, closes, lookback=20):
     elif last_close < recent_low:
         if prior_trend == "down": bos   = "bearish_bos"
         else:                     choch = "bearish_choch"
-
     return bos, choch
 
 
@@ -505,34 +484,23 @@ def full_analysis(symbol: str) -> Optional[dict]:
     vols   = data[:, 5]
     price  = float(closes[-1])
 
-    # ── 指標 ──
     rsi                        = calc_rsi(closes)
-    macd, signal, hist         = calc_macd(closes)
+    macd, macd_sig, hist       = calc_macd(closes)   # 修正1
     bb_upper, bb_mid, bb_lower = calc_bollinger(closes)
     ema20  = float(calc_ema(closes, 20)[-1])
     ema50  = float(calc_ema(closes, 50)[-1])
     ema200 = float(calc_ema(closes, 200)[-1])
     atr    = calc_atr(highs, lows, closes)
 
-    # ── 斐波納契 ──
     swing_high, swing_low = find_swing_points(highs, lows, 50)
-
-    # ── SMC ──
     obs        = detect_order_blocks(opens, highs, lows, closes)
     fvgs       = detect_fvg(highs, lows, closes)
     bos, choch = detect_bos_choch(highs, lows, closes)
+    harmonic   = scan_harmonics(highs, lows, 80)
+    vol_info   = calc_volume_confirmation(vols, closes)
+    candle     = detect_candle_pattern(opens, highs, lows, closes)
+    upper_trend = get_upper_trend(symbol, timeframe)   # 修正4
 
-    # ── 和諧型態 ──
-    harmonic = scan_harmonics(highs, lows, 80)
-
-    # ── 進場精確度加強 ──
-    vol_info = calc_volume_confirmation(vols, closes)     # 修正8
-    candle   = detect_candle_pattern(opens, highs, lows, closes)  # 修正9
-    upper_trend = get_upper_trend(symbol, timeframe)      # 修正10
-
-    # ──────────────────────────────────────────
-    # 多空評分
-    # ──────────────────────────────────────────
     long_score  = 0
     short_score = 0
 
@@ -542,11 +510,11 @@ def full_analysis(symbol: str) -> Optional[dict]:
     elif rsi > 70:      short_score += 2
     elif rsi > 55:      short_score += 1
 
-    # MACD
-    if hist > 0 and macd > signal:    long_score  += 2
-    elif hist < 0 and macd < signal:  short_score += 2
+    # MACD（修正1：用 macd_sig）
+    if hist > 0 and macd > macd_sig:    long_score  += 2
+    elif hist < 0 and macd < macd_sig:  short_score += 2
 
-    # EMA 排列
+    # EMA
     if price > ema20 > ema50 > ema200:    long_score  += 3
     elif price < ema20 < ema50 < ema200:  short_score += 3
     elif price > ema50:                   long_score  += 1
@@ -556,106 +524,101 @@ def full_analysis(symbol: str) -> Optional[dict]:
     if price < bb_lower:   long_score  += 1
     elif price > bb_upper: short_score += 1
 
-    # SMC OB
+    # OB
     if any(o["type"] == "bullish_ob" for o in obs): long_score  += 1
     if any(o["type"] == "bearish_ob" for o in obs): short_score += 1
 
-    # SMC FVG
+    # FVG
     if any(f["type"] == "bullish_fvg" for f in fvgs): long_score  += 1
     if any(f["type"] == "bearish_fvg" for f in fvgs): short_score += 1
 
     # BOS / CHoCH
-    if bos   == "bullish_bos":    long_score  += 2
-    elif bos == "bearish_bos":    short_score += 2
-    if choch == "bullish_choch":  long_score  += 3
-    elif choch == "bearish_choch":short_score += 3
+    if bos   == "bullish_bos":     long_score  += 2
+    elif bos == "bearish_bos":     short_score += 2
+    if choch == "bullish_choch":   long_score  += 3
+    elif choch == "bearish_choch": short_score += 3
 
     # 和諧型態
     if harmonic:
         if harmonic[1] == "long":  long_score  += 2
         else:                      short_score += 2
 
-    # 修正8：成交量確認
+    # 成交量
     if vol_info["bullish_vol"]: long_score  += 2
     if vol_info["bearish_vol"]: short_score += 2
 
-    # 修正9：K 線型態
+    # K 線型態
     if candle["hammer"] or candle["engulfing_bull"] or candle["doji_bull"]:
         long_score  += 2
     if candle["shooting_star"] or candle["engulfing_bear"]:
         short_score += 2
 
-    # 修正10：多週期確認
+    # 修正4：上層週期（None 時不加分）
     upper_agree = False
     if upper_trend == "up":
         long_score  += 2
-        upper_agree = True
+        upper_agree  = True
     elif upper_trend == "down":
         short_score += 2
-        upper_agree = True
+        upper_agree  = True
 
-    # ── 訊號過濾 ──
     score_diff = abs(long_score - short_score)
     max_score  = max(long_score, short_score)
 
-    if long_score == short_score:       return None  # 修正2
-    if score_diff < MIN_SCORE_DIFF:     return None  # 修正5
-    if max_score  < MIN_SCORE_TOTAL:    return None  # 修正6
+    if long_score == short_score:   return None
+    if score_diff < MIN_SCORE_DIFF: return None
+    if max_score < MIN_SCORE_TOTAL: return None
 
-    direction = "long" if long_score > short_score else "short"
+    direction  = "long" if long_score > short_score else "short"
 
-    # 修正11：最佳進場點
+    # 修正5：防重複推播
+    if is_duplicate_signal(symbol, direction):
+        return None
+
     best_entry = get_best_entry(price, obs, fvgs, direction, atr)
     exits      = get_fib_exits(swing_high, swing_low, best_entry, direction)
 
-    # 修正12：信心度
-    has_candle = (candle["hammer"] or candle["engulfing_bull"] or
-                  candle["doji_bull"] or candle["shooting_star"] or
-                  candle["engulfing_bear"])
+    has_candle = any([candle["hammer"], candle["engulfing_bull"],
+                      candle["doji_bull"], candle["shooting_star"],
+                      candle["engulfing_bear"]])
     has_vol    = vol_info["bullish_vol"] or vol_info["bearish_vol"]
     confidence = get_confidence(score_diff, has_vol, has_candle, upper_agree)
 
     return {
-        "symbol":       symbol,
-        "timeframe":    timeframe,
-        "price":        round(price, 6),
-        "direction":    direction,
-        "long_score":   long_score,
-        "short_score":  short_score,
-        "confidence":   confidence,
-        # 進場
-        "entry":        best_entry,
-        "entry_source": "OB/FVG中點" if best_entry != round(price, 6) else "現價",
-        # 技術指標
-        "rsi":          rsi,
-        "macd":         round(macd, 6),
-        "macd_hist":    round(hist, 6),
-        "ema20":        round(ema20, 6),
-        "ema50":        round(ema50, 6),
-        "ema200":       round(ema200, 6),
-        "bb_upper":     round(bb_upper, 6),
-        "bb_lower":     round(bb_lower, 6),
-        "atr":          round(atr, 6),
-        # 斐波納契出場
-        "swing_high":   round(swing_high, 6),
-        "swing_low":    round(swing_low, 6),
-        "stop_loss":    exits["stop_loss"],
-        "tp1":          exits["tp1"],
-        "tp2":          exits["tp2"],
-        "tp3":          exits["tp3"],
-        "risk_reward":  exits["risk_reward"],
-        "fib_levels":   exits["fib_levels"],
-        # SMC
-        "order_blocks": obs,
-        "fvg":          fvgs,
-        "bos":          bos,
-        "choch":        choch,
-        # 進場精確度
+        "symbol":         symbol,
+        "timeframe":      timeframe,
+        "price":          round(price, 6),
+        "direction":      direction,
+        "long_score":     long_score,
+        "short_score":    short_score,
+        "confidence":     confidence,
+        "entry":          best_entry,
+        "entry_source":   "OB/FVG中點" if best_entry != round(price, 6) else "現價",
+        "rsi":            rsi,
+        "macd":           round(macd, 6),
+        "macd_hist":      round(hist, 6),
+        "ema20":          round(ema20, 6),
+        "ema50":          round(ema50, 6),
+        "ema200":         round(ema200, 6),
+        "bb_upper":       round(bb_upper, 6),
+        "bb_lower":       round(bb_lower, 6),
+        "atr":            round(atr, 6),
+        "swing_high":     round(swing_high, 6),
+        "swing_low":      round(swing_low, 6),
+        "stop_loss":      exits["stop_loss"],
+        "tp1":            exits["tp1"],
+        "tp2":            exits["tp2"],
+        "tp3":            exits["tp3"],
+        "risk_reward":    exits["risk_reward"],
+        "fib_levels":     exits["fib_levels"],
+        "order_blocks":   obs,
+        "fvg":            fvgs,
+        "bos":            bos,
+        "choch":          choch,
         "candle_pattern": candle["name"],
         "vol_ratio":      vol_info["vol_ratio"],
         "upper_trend":    upper_trend or "—",
-        # 和諧型態
-        "harmonic":     harmonic,
+        "harmonic":       harmonic,
     }
 
 
@@ -671,57 +634,54 @@ def format_signal(r: dict) -> str:
     upper_emoji     = "📈" if r["upper_trend"] == "up" else ("📉" if r["upper_trend"] == "down" else "—")
 
     rsi = r["rsi"]
-    if rsi < 30:      rsi_label = "超賣🔥"
-    elif rsi > 70:    rsi_label = "超買❄️"
-    elif rsi < 45:    rsi_label = "偏弱⬇️"
-    elif rsi > 55:    rsi_label = "偏強⬆️"
-    else:             rsi_label = "中性⚪️"
+    if rsi < 30:   rsi_label = "超賣🔥"
+    elif rsi > 70: rsi_label = "超買❄️"
+    elif rsi < 45: rsi_label = "偏弱⬇️"
+    elif rsi > 55: rsi_label = "偏強⬆️"
+    else:          rsi_label = "中性⚪️"
 
-    msg = (
+    return (
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📌 *{r['symbol']}USDT* ｜ {r['timeframe']} ｜ {direction_emoji}\n"
         f"🎯 信心度：{r['confidence']}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 *進場價格*：`{r['entry']}` ({r['entry_source']})\n"
+        f"💰 *進場*：`{r['entry']}` ({r['entry_source']})\n"
         f"\n"
         f"📐 *斐波納契出場*\n"
-        f"  🛑 止損  (Fib 0.618)：`{r['stop_loss']}`\n"
-        f"  🎯 止盈1 (Fib 1.272)：`{r['tp1']}`\n"
-        f"  🎯 止盈2 (Fib 1.618)：`{r['tp2']}`\n"
-        f"  🎯 止盈3 (Fib 2.618)：`{r['tp3']}`\n"
-        f"  ⚖️  風報比 R:R        ：`1 : {r['risk_reward']}`\n"
+        f"  🛑 止損  (0.618)：`{r['stop_loss']}`\n"
+        f"  🎯 止盈1 (1.272)：`{r['tp1']}`\n"
+        f"  🎯 止盈2 (1.618)：`{r['tp2']}`\n"
+        f"  🎯 止盈3 (2.618)：`{r['tp3']}`\n"
+        f"  ⚖️  風報比 R:R   ：`1 : {r['risk_reward']}`\n"
         f"\n"
         f"📊 *技術指標*\n"
-        f"  RSI      ：`{r['rsi']}` {rsi_label}\n"
-        f"  MACD     ：`{r['macd']}` ｜ Hist `{r['macd_hist']}`\n"
-        f"  EMA20    ：`{r['ema20']}`\n"
-        f"  EMA50    ：`{r['ema50']}`\n"
-        f"  EMA200   ：`{r['ema200']}`\n"
-        f"  BB上軌   ：`{r['bb_upper']}` / 下軌：`{r['bb_lower']}`\n"
-        f"  ATR      ：`{r['atr']}`\n"
+        f"  RSI    ：`{r['rsi']}` {rsi_label}\n"
+        f"  MACD   ：`{r['macd']}` ｜ Hist `{r['macd_hist']}`\n"
+        f"  EMA20  ：`{r['ema20']}`\n"
+        f"  EMA50  ：`{r['ema50']}`\n"
+        f"  EMA200 ：`{r['ema200']}`\n"
+        f"  BB上軌 ：`{r['bb_upper']}` / 下軌：`{r['bb_lower']}`\n"
+        f"  ATR    ：`{r['atr']}`\n"
         f"\n"
         f"🕯 *K線型態*：{r['candle_pattern']}\n"
         f"📦 *成交量比*：`{r['vol_ratio']}x`\n"
         f"🌐 *上層週期*：{upper_emoji} {r['upper_trend']}\n"
         f"\n"
         f"🏗️ *SMC 結構*\n"
-        f"  BOS      ：{bos_str}\n"
-        f"  CHoCH    ：{choch_str}\n"
-        f"  OB 數量  ：{len(r['order_blocks'])} 個\n"
-        f"  FVG 數量 ：{len(r['fvg'])} 個\n"
+        f"  BOS    ：{bos_str}\n"
+        f"  CHoCH  ：{choch_str}\n"
+        f"  OB     ：{len(r['order_blocks'])} 個\n"
+        f"  FVG    ：{len(r['fvg'])} 個\n"
         f"\n"
         f"🔷 *和諧型態*：{harmonic_str}\n"
         f"\n"
         f"📈 *評分*：多 {r['long_score']} ／ 空 {r['short_score']}\n"
-        f"🕯 *Swing High*：`{r['swing_high']}`\n"
-        f"🕯 *Swing Low* ：`{r['swing_low']}`\n"
+        f"🕯 Swing High：`{r['swing_high']}` / Low：`{r['swing_low']}`\n"
         f"━━━━━━━━━━━━━━━━━━━━"
     )
-    return msg
 
 
 if __name__ == "__main__":
-    print("=== 分析 BTC ===")
     result = full_analysis("BTC")
     if result:
         print(format_signal(result))
