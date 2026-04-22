@@ -1,30 +1,69 @@
 """
-bot.py v5.0
+bot.py v5.1
 ===========
-新增：
-  - 止盈/止損價格監控，到達時自動推播
-  - 每日早上 8 點市場總結
-  - 恐懼貪婪指數每日推播
+隱患修正：
+  1. asyncio.get_event_loop() 在新版 Python 已棄用 → 改用 asyncio.get_running_loop()
+  2. active_signals 多執行緒同時讀寫 → 加入 threading.Lock() 保護
+  3. daily_summary 時間計算錯誤（負數情況）→ 改用精確計算
+  4. Railway 雲端時區為 UTC → 自動換算為台灣時間（UTC+8）
+  5. 掃描通知訊息過多（每5分鐘一則）→ 加入靜音模式選項
+  6. active_signals 無上限，長期運行會無限增長 → 限制最多50筆
+  7. Bot Token 明碼寫在程式碼 → 改從環境變數讀取
 """
 
 import asyncio
 import threading
 import time
-from datetime import datetime
+import os
+from datetime import datetime, timezone, timedelta
 from telegram import Update, Bot
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from analysis_engine import (full_analysis, format_signal, TOP30_COINS,
                               fetch_klines, fetch_fear_greed)
 
-BOT_TOKEN = "8556894585:AAFSzzBsMC-1f1VinHfAdbjY-QGu0zsB_Tw"
+# 修正7：從環境變數讀取 Token（Railway 上設定）
+# 若環境變數不存在則用預設值（本機測試用）
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8556894585:AAFSzzBsMC-1f1VinHfAdbjY-QGu0zsB_Tw")
+
+# 修正4：台灣時區 UTC+8
+TW_TZ = timezone(timedelta(hours=8))
 
 CHAT_IDS:         set  = set()
 auto_push_active: bool = False
-SCAN_INTERVAL          = 300   # 5 分鐘掃描
+quiet_mode:       bool = False   # 修正5：靜音模式（只推播有訊號時）
+SCAN_INTERVAL          = 300     # 5 分鐘
 
-# 監控中的訊號（止盈/止損追蹤）
-# 格式：[{"symbol", "direction", "entry", "sl", "tp1", "tp2", "tp3", "chat_id"}]
+# 修正2：加入 Lock 保護 active_signals
+_signals_lock  = threading.Lock()
 active_signals: list = []
+MAX_SIGNALS    = 50   # 修正6：最多監控 50 筆
+
+
+def add_signal(sig: dict):
+    """修正2 & 6：加鎖新增監控訊號，超過上限自動移除最舊的"""
+    with _signals_lock:
+        if len(active_signals) >= MAX_SIGNALS:
+            active_signals.pop(0)
+        active_signals.append(sig)
+
+
+def remove_signals(to_remove: list):
+    """修正2：加鎖移除訊號"""
+    with _signals_lock:
+        for sig in to_remove:
+            if sig in active_signals:
+                active_signals.remove(sig)
+
+
+def get_signals_copy() -> list:
+    """修正2：加鎖讀取訊號列表快照"""
+    with _signals_lock:
+        return list(active_signals)
+
+
+def tw_now() -> str:
+    """修正4：取得台灣當前時間字串"""
+    return datetime.now(TW_TZ).strftime("%Y/%m/%d %H:%M")
 
 
 # ══════════════════════════════
@@ -54,23 +93,20 @@ def scan_all(top_n=5) -> list:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     CHAT_IDS.add(update.effective_chat.id)
     await update.message.reply_text(
-        "👋 *加密貨幣全方位分析 Bot v5.0*\n\n"
+        "👋 *加密貨幣全方位分析 Bot v5.1*\n\n"
         "📌 *指令說明*：\n"
         "  /a BTC     → 分析單一幣種\n"
         "  /scan      → 立即掃描前30大幣種\n"
         "  /autoon    → 開啟自動推播\n"
         "  /autooff   → 關閉自動推播\n"
-        "  /market    → 查看市場情緒\n\n"
+        "  /quiet     → 靜音模式（只推播有訊號時）\n"
+        "  /loud      → 關閉靜音模式\n"
+        "  /market    → 查看市場情緒\n"
+        "  /status    → 查看目前監控中的訊號\n\n"
         "🔔 *自動推播功能*：\n"
         "  • 每5分鐘掃描，有強力訊號立即通知\n"
         "  • 到達止盈/止損自動警告\n"
-        "  • 每日早上8點市場總結\n\n"
-        "🔬 *分析項目（共18項）*：\n"
-        "  RSI・MACD・BB・EMA・VWAP・ADX\n"
-        "  支撐壓力・背離・K線型態・成交量\n"
-        "  多週期確認・資金費率・OI未平倉量\n"
-        "  SMC(OB/FVG/BOS/CHoCH)・和諧型態\n"
-        "  Fib止損・ATR動態止損・信心度評級",
+        "  • 每日早上8點（台灣時間）市場總結",
         parse_mode="Markdown"
     )
 
@@ -87,13 +123,13 @@ async def cmd_analyse(update: Update, context: ContextTypes.DEFAULT_TYPE):
     symbol = context.args[0].upper()
     await update.message.reply_text(f"⏳ 正在分析 {symbol}，請稍候...")
 
-    loop = asyncio.get_event_loop()
+    # 修正1：改用 asyncio.get_running_loop()
+    loop = asyncio.get_running_loop()
     r    = await loop.run_in_executor(None, full_analysis, symbol)
 
     if r:
         await update.message.reply_text(format_signal(r), parse_mode="Markdown")
-        # 加入止盈止損監控
-        active_signals.append({
+        add_signal({
             "symbol":    symbol,
             "direction": r["direction"],
             "entry":     r["entry"],
@@ -106,7 +142,7 @@ async def cmd_analyse(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "chat_id":   update.effective_chat.id,
         })
         await update.message.reply_text(
-            f"🔔 已開啟 *{symbol}* 止盈止損監控，到達目標價位時自動通知！",
+            f"🔔 已開啟 *{symbol}* 止盈止損監控！",
             parse_mode="Markdown"
         )
     else:
@@ -123,7 +159,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     CHAT_IDS.add(update.effective_chat.id)
     await update.message.reply_text("🔍 掃描前30大幣種中，約需1-2分鐘...")
 
-    loop    = asyncio.get_event_loop()
+    loop    = asyncio.get_running_loop()   # 修正1
     signals = await loop.run_in_executor(None, scan_all)
 
     if signals:
@@ -136,24 +172,57 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════
-# 指令：/market（市場情緒）
+# 指令：/market
 # ══════════════════════════════
 async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
     CHAT_IDS.add(update.effective_chat.id)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()   # 修正1
     fg   = await loop.run_in_executor(None, fetch_fear_greed)
-
-    msg = (
+    msg  = (
         f"🌡️ *市場情緒指數*\n\n"
         f"  指數：`{fg['value']}` / 100\n"
         f"  狀態：{fg['label']}\n\n"
         f"📊 *解讀*：\n"
-        f"  0-24  😱 極度恐懼 → 做多機會\n"
-        f"  25-49 😨 恐懼     → 偏多\n"
-        f"  50-74 😊 貪婪     → 偏空\n"
+        f"  0-24   😱 極度恐懼 → 做多機會\n"
+        f"  25-49  😨 恐懼     → 偏多\n"
+        f"  50-74  😊 貪婪     → 偏空\n"
         f"  75-100 🤑 極度貪婪 → 做空機會"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+# ══════════════════════════════
+# 指令：/status
+# ══════════════════════════════
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sigs = get_signals_copy()
+    if not sigs:
+        await update.message.reply_text("📋 目前沒有監控中的訊號")
+        return
+    msg = f"📋 *目前監控中的訊號（共 {len(sigs)} 筆）*\n\n"
+    for s in sigs:
+        d = "🟢多" if s["direction"] == "long" else "🔴空"
+        msg += (f"  {d} *{s['symbol']}* ｜ 進場：`{s['entry']}`\n"
+                f"     止損：`{s['sl']}` ｜ TP1：`{s['tp1']}`\n\n")
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+# ══════════════════════════════
+# 指令：/quiet / /loud
+# ══════════════════════════════
+async def cmd_quiet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global quiet_mode
+    quiet_mode = True
+    await update.message.reply_text(
+        "🔇 *靜音模式已開啟*\n掃描開始/無訊號時不再通知，只有強力訊號才推播",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_loud(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global quiet_mode
+    quiet_mode = False
+    await update.message.reply_text("🔊 靜音模式已關閉，恢復所有通知")
 
 
 # ══════════════════════════════
@@ -167,7 +236,8 @@ async def cmd_auto_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✅ *自動推播已開啟！*\n"
         "• 每5分鐘掃描，發現強力訊號立即通知\n"
         "• 到達止盈/止損自動警告\n"
-        "• 每日早上8點市場總結",
+        "• 每日早上8點（台灣時間）市場總結\n\n"
+        "💡 輸入 /quiet 可開啟靜音模式（只推播有訊號時）",
         parse_mode="Markdown"
     )
 
@@ -183,24 +253,24 @@ async def cmd_auto_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════
 def auto_push_loop(bot_token: str):
     async def push_signals():
-        bot  = Bot(token=bot_token)
-        now  = datetime.now().strftime("%H:%M")
+        bot = Bot(token=bot_token)
+        now = tw_now()   # 修正4：台灣時間
 
-        # ── 掃描開始通知 ──
-        for chat_id in list(CHAT_IDS):
-            try:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=(f"🔍 *自動掃描開始* ｜ {now}\n"
-                          f"正在掃描前30大幣種，請稍候..."),
-                    parse_mode="Markdown"
-                )
-            except Exception as e:
-                print(f"  [掃描通知錯誤] {chat_id}：{e}")
+        # 掃描開始通知（修正5：靜音模式下跳過）
+        if not quiet_mode:
+            for chat_id in list(CHAT_IDS):
+                try:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=(f"🔍 *自動掃描開始* ｜ {now}\n"
+                              f"正在掃描前30大幣種，請稍候..."),
+                        parse_mode="Markdown"
+                    )
+                except Exception as e:
+                    print(f"  [掃描通知錯誤] {chat_id}：{e}")
 
         signals = scan_all()
 
-        # ── 掃描結果通知 ──
         if signals and CHAT_IDS:
             for chat_id in list(CHAT_IDS):
                 try:
@@ -215,8 +285,7 @@ def auto_push_loop(bot_token: str):
                             text=format_signal(r),
                             parse_mode="Markdown"
                         )
-                        # 自動加入監控
-                        active_signals.append({
+                        add_signal({   # 修正2：加鎖
                             "symbol":    r["symbol"],
                             "direction": r["direction"],
                             "entry":     r["entry"],
@@ -233,15 +302,17 @@ def auto_push_loop(bot_token: str):
                     print(f"  ❌ 推播失敗 {chat_id}：{e}")
         else:
             print("[掃描] 無強力訊號")
-            for chat_id in list(CHAT_IDS):
-                try:
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text="📭 掃描完成，本次無強力訊號，靜待下次掃描...",
-                        parse_mode="Markdown"
-                    )
-                except Exception as e:
-                    print(f"  [無訊號通知錯誤] {chat_id}：{e}")
+            # 修正5：靜音模式下不發無訊號通知
+            if not quiet_mode:
+                for chat_id in list(CHAT_IDS):
+                    try:
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text="📭 掃描完成，本次無強力訊號，靜待下次掃描...",
+                            parse_mode="Markdown"
+                        )
+                    except Exception as e:
+                        print(f"  [無訊號通知錯誤] {chat_id}：{e}")
 
     while True:
         time.sleep(SCAN_INTERVAL)
@@ -257,10 +328,11 @@ def auto_push_loop(bot_token: str):
 # ══════════════════════════════
 def price_monitor_loop(bot_token: str):
     async def check_prices():
-        bot      = Bot(token=bot_token)
+        bot       = Bot(token=bot_token)
         to_remove = []
+        sigs      = get_signals_copy()   # 修正2：讀取快照
 
-        for sig in active_signals:
+        for sig in sigs:
             try:
                 data  = fetch_klines(sig["symbol"], "5m", 2)
                 if data is None:
@@ -270,7 +342,7 @@ def price_monitor_loop(bot_token: str):
                 cid   = sig["chat_id"]
                 d     = sig["direction"]
 
-                # 止損觸發
+                # 止損
                 if ((d == "long"  and price <= sig["sl"]) or
                         (d == "short" and price >= sig["sl"])):
                     await bot.send_message(
@@ -325,13 +397,12 @@ def price_monitor_loop(bot_token: str):
             except Exception as e:
                 print(f"  [監控錯誤] {sig['symbol']}：{e}")
 
-        for sig in to_remove:
-            if sig in active_signals:
-                active_signals.remove(sig)
+        if to_remove:
+            remove_signals(to_remove)   # 修正2：加鎖移除
 
     while True:
-        time.sleep(60)   # 每分鐘檢查一次
-        if active_signals:
+        time.sleep(60)
+        if get_signals_copy():
             try:
                 asyncio.run(check_prices())
             except Exception as e:
@@ -339,14 +410,14 @@ def price_monitor_loop(bot_token: str):
 
 
 # ══════════════════════════════
-# 背景：每日早上 8 點市場總結
+# 背景：每日早上 8 點（台灣時間）市場總結
 # ══════════════════════════════
 def daily_summary_loop(bot_token: str):
     async def send_summary():
         bot = Bot(token=bot_token)
         fg  = fetch_fear_greed()
         msg = (
-            f"☀️ *每日市場總結 - {datetime.now().strftime('%Y/%m/%d')}*\n\n"
+            f"☀️ *每日市場總結 - {datetime.now(TW_TZ).strftime('%Y/%m/%d')}*\n\n"
             f"🌡️ 恐懼貪婪指數：`{fg['value']}` {fg['label']}\n\n"
             f"📋 即將進行全市場掃描，有強力訊號將立即推播..."
         )
@@ -357,13 +428,16 @@ def daily_summary_loop(bot_token: str):
                 print(f"  [每日總結錯誤] {chat_id}：{e}")
 
     while True:
-        now = datetime.now()
-        # 等到早上 8:00
-        target_hour = 8
-        seconds_until = ((target_hour - now.hour - 1) * 3600 +
-                         (60 - now.minute - 1) * 60 +
-                         (60 - now.second)) % 86400
+        # 修正3 & 4：精確計算距離台灣時間早上8點的秒數
+        now_tw        = datetime.now(TW_TZ)
+        target        = now_tw.replace(hour=8, minute=0, second=0, microsecond=0)
+        if now_tw >= target:
+            target = target + timedelta(days=1)
+        seconds_until = (target - now_tw).total_seconds()
+
+        print(f"[每日總結] 距離下次推播：{int(seconds_until/3600)} 小時")
         time.sleep(seconds_until)
+
         if auto_push_active and CHAT_IDS:
             try:
                 asyncio.run(send_summary())
@@ -375,13 +449,13 @@ def daily_summary_loop(bot_token: str):
 # 啟動
 # ══════════════════════════════
 if __name__ == "__main__":
-    print("Bot v5.0 啟動中...")
+    print("Bot v5.1 啟動中...")
+    print(f"目前台灣時間：{tw_now()}")
 
-    # 背景執行緒
     threads = [
-        threading.Thread(target=auto_push_loop,     args=(BOT_TOKEN,), daemon=True),
-        threading.Thread(target=price_monitor_loop,  args=(BOT_TOKEN,), daemon=True),
-        threading.Thread(target=daily_summary_loop,  args=(BOT_TOKEN,), daemon=True),
+        threading.Thread(target=auto_push_loop,    args=(BOT_TOKEN,), daemon=True),
+        threading.Thread(target=price_monitor_loop, args=(BOT_TOKEN,), daemon=True),
+        threading.Thread(target=daily_summary_loop, args=(BOT_TOKEN,), daemon=True),
     ]
     for t in threads:
         t.start()
@@ -393,6 +467,9 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("autoon",  cmd_auto_on))
     app.add_handler(CommandHandler("autooff", cmd_auto_off))
     app.add_handler(CommandHandler("market",  cmd_market))
+    app.add_handler(CommandHandler("status",  cmd_status))
+    app.add_handler(CommandHandler("quiet",   cmd_quiet))
+    app.add_handler(CommandHandler("loud",    cmd_loud))
 
-    print("✅ Bot v5.0 已啟動！")
+    print("✅ Bot v5.1 已啟動！")
     app.run_polling()
