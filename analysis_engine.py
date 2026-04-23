@@ -20,6 +20,7 @@ import os
 import requests
 import numpy as np
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ──────────────────────────────────────────────
 # 常數
@@ -47,18 +48,13 @@ FIB_RETRACEMENT = [0.236, 0.382, 0.5, 0.618, 0.786]
 FIB_EXTENSION   = [1.0, 1.272, 1.414, 1.618, 2.0, 2.618]
 EPS             = 1e-10
 
-# Binance 備用域名（依序嘗試，解決 451 地理限制）
+# Binance 正確備用域名（Binance 官方提供）
 BINANCE_KLINE_URLS = [
     "https://api.binance.com/api/v3/klines",
-    "https://api1.binance.com/api/v3/klines",
-    "https://api2.binance.com/api/v3/klines",
-    "https://api3.binance.com/api/v3/klines",
-    "https://api4.binance.com/api/v3/klines",
+    "https://data.binance.com/api/v3/klines",
 ]
 FUTURES_BASE_URLS = [
     "https://fapi.binance.com/fapi/v1",
-    "https://fapi1.binance.com/fapi/v1",
-    "https://fapi2.binance.com/fapi/v1",
 ]
 # 保留舊變數名相容性
 BINANCE_URL = BINANCE_KLINE_URLS[0]
@@ -73,8 +69,10 @@ _adaptive_params = {
     "vol_threshold":   1.5,
 }
 
-# 防重複
+# 防重複（加入 Lock 保護並行掃描的競態條件）
+import threading as _threading
 _signal_cache: dict = {}
+_cache_lock = _threading.Lock()
 
 # ──────────────────────────────────────────────
 # 系統4：風控系統
@@ -460,58 +458,54 @@ def quick_backtest(symbols: list = None, periods: int = 80) -> dict:
 # ──────────────────────────────────────────────
 
 def fetch_klines(symbol: str, interval: str = "4h",
-                 limit: int = 200, retries: int = 2) -> Optional[np.ndarray]:
+                 limit: int = 200, retries: int = 1) -> Optional[np.ndarray]:
     """
-    自動嘗試所有備用域名，解決 Binance 451 地理限制問題
-    每個域名最多重試 retries 次
+    自動嘗試備用域名，解決 Binance 451 地理限制
+    retries=1：每個域名只試一次，確保掃描速度在 2~3 分鐘內
     """
     pair   = f"{symbol}USDT"
     params = {"symbol": pair, "interval": interval, "limit": limit}
 
     for url in BINANCE_KLINE_URLS:
-        for attempt in range(retries):
-            try:
-                resp = requests.get(url, params=params, timeout=10)
+        try:
+            resp = requests.get(url, params=params, timeout=8)
 
-                # 451 = 地理限制，直接換下一個域名
-                if resp.status_code == 451:
-                    print(f"  🌐 {url} 地理限制(451)，嘗試備用域名...")
-                    break
+            # 451 = 地理限制，直接換下一個域名，不重試
+            if resp.status_code == 451:
+                print(f"  🌐 {url} 地理限制(451)，換備用域名...")
+                continue
 
-                resp.raise_for_status()
-                raw = resp.json()
+            # 其他錯誤也換域名
+            if not resp.ok:
+                print(f"  ⚠️ {symbol} {url} 狀態碼：{resp.status_code}")
+                continue
 
-                if not raw or isinstance(raw, dict):
-                    return None
+            raw = resp.json()
+            if not raw or isinstance(raw, dict):
+                return None
 
-                data = np.array(
-                    [[float(k[0]), float(k[1]), float(k[2]),
-                      float(k[3]), float(k[4]), float(k[5])]
-                     for k in raw],
-                    dtype=np.float64
-                )
+            data = np.array(
+                [[float(k[0]), float(k[1]), float(k[2]),
+                  float(k[3]), float(k[4]), float(k[5])]
+                 for k in raw],
+                dtype=np.float64
+            )
 
-                if data.ndim != 2 or data.shape[1] < 6:
-                    return None
-                if np.isnan(data).any() or np.isinf(data).any():
-                    return None
-                if data[:, 5].sum() < EPS:
-                    return None
+            if data.ndim != 2 or data.shape[1] < 6:
+                return None
+            if np.isnan(data).any() or np.isinf(data).any():
+                return None
+            if data[:, 5].sum() < EPS:
+                return None
 
-                return data   # ✅ 成功
+            return data   # ✅ 成功
 
-            except requests.exceptions.HTTPError as e:
-                if "451" in str(e):
-                    print(f"  🌐 {url} 地理限制，換域名...")
-                    break
-                print(f"  ⚠️ {symbol} {interval} [{url}] 第{attempt+1}次失敗：{e}")
-                if attempt < retries - 1:
-                    time.sleep(1)
-
-            except Exception as e:
-                print(f"  ⚠️ {symbol} {interval} [{url}] 第{attempt+1}次失敗：{e}")
-                if attempt < retries - 1:
-                    time.sleep(1)
+        except requests.exceptions.Timeout:
+            print(f"  ⚠️ {symbol} {url} 逾時，換域名")
+            continue
+        except Exception as e:
+            print(f"  ⚠️ {symbol} {url} 失敗：{e}")
+            continue
 
     print(f"  ❌ {symbol} {interval} 所有域名均失敗")
     return None
@@ -523,14 +517,16 @@ def select_timeframe(symbol: str) -> str:
 
 def is_duplicate_signal(symbol: str, direction: str,
                         price: float, atr: float) -> bool:
-    key        = f"{symbol}_{direction}"
-    last_price = _signal_cache.get(key)
-    if last_price is None:
-        _signal_cache[key] = price
-        return False
-    if abs(price - last_price) > atr * 1.5:
-        _signal_cache[key] = price
-        return False
+    """修正：加入 Lock 保護並行環境下的競態條件"""
+    key = f"{symbol}_{direction}"
+    with _cache_lock:
+        last_price = _signal_cache.get(key)
+        if last_price is None:
+            _signal_cache[key] = price
+            return False
+        if abs(price - last_price) > atr * 1.5:
+            _signal_cache[key] = price
+            return False
     return True
 
 
@@ -869,7 +865,13 @@ def detect_candle_pattern(opens, highs, lows, closes) -> dict:
 # 多週期
 # ──────────────────────────────────────────────
 
+# 是否在並行掃描模式（並行時跳過上層週期，節省時間）
+_parallel_mode = False
+
 def get_upper_trend(symbol: str, main_tf: str) -> Optional[str]:
+    """並行掃描模式下跳過，節省 50% 時間"""
+    if _parallel_mode:
+        return None   # 並行掃描時不做額外 API 請求
     utf = UPPER_TIMEFRAME.get(main_tf)
     if not utf: return None
     data = fetch_klines(symbol, utf, 60)
@@ -1124,7 +1126,7 @@ def full_analysis(symbol: str) -> Optional[dict]:
         atr=calc_atr(h,l,c); vwap=calc_vwap(h,l,c,v)
         adx=calc_adx(h,l,c); ms_info=detect_market_structure(h,l,c,atr)
         bo=detect_breakout(h,l,c,v,atr); sr=detect_support_resistance(h,l,c)
-        div=detect_divergence(h,l,c); funding=fetch_funding_rate(symbol); oi=fetch_open_interest(symbol)
+        div=detect_divergence(h,l,c,lookback=20); funding=fetch_funding_rate(symbol); oi=fetch_open_interest(symbol)
         sh,sl=find_swing_points(h,l,50); obs=detect_order_blocks(o,h,l,c)
         fvgs=detect_fvg(h,l,c); bos,choch=detect_bos_choch(h,l,c)
         harmonic=scan_harmonics(h,l,80); vi=calc_volume_confirmation(v,c)
@@ -1151,10 +1153,13 @@ def full_analysis(symbol: str) -> Optional[dict]:
         # VWAP
         if price>vwap: long_s+=1
         elif price<vwap: short_s+=1
-        # ADX
+        # ADX（修正：正向 ADX 依 PDI/MDI 方向只加給一方）
         sc=adx["adx_score"]
-        if sc>0: long_s+=sc; short_s+=sc
-        else: long_s=max(0,long_s+sc); short_s=max(0,short_s+sc)
+        if sc>0:
+            if adx["pdi"]>adx["mdi"]: long_s+=sc
+            else:                      short_s+=sc
+        else:
+            long_s=max(0,long_s+sc); short_s=max(0,short_s+sc)
         if adx["pdi"]>adx["mdi"]: long_s+=1
         else: short_s+=1
         # 市場結構
@@ -1376,6 +1381,53 @@ def format_signal(r: dict) -> str:
         )
     except Exception as e:
         return f"❌ 格式化錯誤：{e}"
+
+
+# ──────────────────────────────────────────────
+# 並行掃描（控制在 2~3 分鐘內）
+# ──────────────────────────────────────────────
+
+def scan_single(symbol: str):
+    """掃描單一幣種，供 ThreadPoolExecutor 使用"""
+    try:
+        r = full_analysis(symbol)
+        if r:
+            return (max(r["long_score"], r["short_score"]), r)
+    except Exception as e:
+        print(f"  ❌ {symbol} 失敗：{e}")
+    return None
+
+
+def parallel_scan(top_n: int = 5, max_workers: int = 8) -> list:
+    """
+    並行掃描所有幣種
+    max_workers=8：同時掃描 8 個幣種（加速）
+    並行模式下跳過上層週期 API，節省 50% 時間
+    預估時間：約 1.5~2.5 分鐘
+    """
+    global _parallel_mode
+    _parallel_mode = True   # 啟用並行模式
+    results = []
+    print(f"[掃描] 並行掃描 {len(TOP30_COINS)} 個幣種（{max_workers} 線程，並行模式）...")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(scan_single, sym): sym for sym in TOP30_COINS}
+        for future in as_completed(futures):
+            sym = futures[future]
+            try:
+                result = future.result(timeout=60)
+                if result:
+                    score, r = result
+                    results.append((score, r))
+                    print(f"  ✅ {sym} 訊號！分數：{score} 勝率：{r['winrate_pct']}%")
+                else:
+                    print(f"  ⏭ {sym} 無訊號")
+            except Exception as e:
+                print(f"  ❌ {sym} 超時或失敗：{e}")
+
+    _parallel_mode = False   # 還原模式
+    results.sort(key=lambda x: x[0], reverse=True)
+    return [r for _, r in results[:top_n]]
 
 
 # 初始化

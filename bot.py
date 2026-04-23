@@ -31,6 +31,7 @@ from analysis_engine import (
     get_market_volatility, update_adaptive_params,
     get_risk_status, reset_risk_pause, record_trade_result,
     ml_update, _signal_cache,
+    parallel_scan,
 )
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8556894585:AAFSzzBsMC-1f1VinHfAdbjY-QGu0zsB_Tw")
@@ -73,21 +74,10 @@ def tw_now() -> str:
 
 
 def scan_all(top_n: int = 5) -> list:
-    results = []
-    print(f"[掃描] 開始掃描 {len(TOP30_COINS)} 個幣種...")
-    for symbol in TOP30_COINS:
-        try:
-            r = full_analysis(symbol)
-            if r:
-                score = max(r["long_score"], r["short_score"])
-                results.append((score, r))
-                print(f"  ✅ {symbol} 訊號！分數：{score} 勝率預測：{r['winrate_pct']}%")
-            else:
-                print(f"  ⏭ {symbol} 無訊號")
-        except Exception as e:
-            print(f"  ❌ {symbol} 失敗：{e}")
-    results.sort(key=lambda x: x[0], reverse=True)
-    return [r for _, r in results[:top_n]]
+    """
+    使用並行掃描，控制在 2~3 分鐘內完成
+    """
+    return parallel_scan(top_n=top_n, max_workers=6)
 
 
 # ══════════════════════════════

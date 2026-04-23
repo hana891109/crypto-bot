@@ -1,0 +1,9 @@
+services:
+  - type: worker
+    name: crypto-bot
+    runtime: python
+    buildCommand: pip install python-telegram-bot requests numpy
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
