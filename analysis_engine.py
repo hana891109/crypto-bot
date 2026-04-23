@@ -45,9 +45,24 @@ COIN_TIMEFRAME = {
 UPPER_TIMEFRAME = {"15m": "1h", "1h": "4h", "4h": "1d", "1d": "1w"}
 FIB_RETRACEMENT = [0.236, 0.382, 0.5, 0.618, 0.786]
 FIB_EXTENSION   = [1.0, 1.272, 1.414, 1.618, 2.0, 2.618]
-BINANCE_URL     = "https://api.binance.com/api/v3/klines"
-FUTURES_URL     = "https://fapi.binance.com/fapi/v1"
 EPS             = 1e-10
+
+# Binance 備用域名（依序嘗試，解決 451 地理限制）
+BINANCE_KLINE_URLS = [
+    "https://api.binance.com/api/v3/klines",
+    "https://api1.binance.com/api/v3/klines",
+    "https://api2.binance.com/api/v3/klines",
+    "https://api3.binance.com/api/v3/klines",
+    "https://api4.binance.com/api/v3/klines",
+]
+FUTURES_BASE_URLS = [
+    "https://fapi.binance.com/fapi/v1",
+    "https://fapi1.binance.com/fapi/v1",
+    "https://fapi2.binance.com/fapi/v1",
+]
+# 保留舊變數名相容性
+BINANCE_URL = BINANCE_KLINE_URLS[0]
+FUTURES_URL = FUTURES_BASE_URLS[0]
 
 # 動態門檻（會被自適應系統調整）
 _adaptive_params = {
@@ -445,33 +460,60 @@ def quick_backtest(symbols: list = None, periods: int = 80) -> dict:
 # ──────────────────────────────────────────────
 
 def fetch_klines(symbol: str, interval: str = "4h",
-                 limit: int = 200, retries: int = 3) -> Optional[np.ndarray]:
-    pair = f"{symbol}USDT"
-    for attempt in range(retries):
-        try:
-            resp = requests.get(
-                BINANCE_URL,
-                params={"symbol": pair, "interval": interval, "limit": limit},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            raw = resp.json()
-            if not raw or isinstance(raw, dict):
-                return None
-            data = np.array([[float(k[0]), float(k[1]), float(k[2]),
-                               float(k[3]), float(k[4]), float(k[5])]
-                              for k in raw], dtype=np.float64)
-            if data.ndim != 2 or data.shape[1] < 6:
-                return None
-            if np.isnan(data).any() or np.isinf(data).any():
-                return None
-            if data[:, 5].sum() < EPS:
-                return None
-            return data
-        except Exception as e:
-            print(f"  ⚠️ {symbol} {interval} 第{attempt+1}次失敗：{e}")
-            if attempt < retries - 1:
-                time.sleep(2)
+                 limit: int = 200, retries: int = 2) -> Optional[np.ndarray]:
+    """
+    自動嘗試所有備用域名，解決 Binance 451 地理限制問題
+    每個域名最多重試 retries 次
+    """
+    pair   = f"{symbol}USDT"
+    params = {"symbol": pair, "interval": interval, "limit": limit}
+
+    for url in BINANCE_KLINE_URLS:
+        for attempt in range(retries):
+            try:
+                resp = requests.get(url, params=params, timeout=10)
+
+                # 451 = 地理限制，直接換下一個域名
+                if resp.status_code == 451:
+                    print(f"  🌐 {url} 地理限制(451)，嘗試備用域名...")
+                    break
+
+                resp.raise_for_status()
+                raw = resp.json()
+
+                if not raw or isinstance(raw, dict):
+                    return None
+
+                data = np.array(
+                    [[float(k[0]), float(k[1]), float(k[2]),
+                      float(k[3]), float(k[4]), float(k[5])]
+                     for k in raw],
+                    dtype=np.float64
+                )
+
+                if data.ndim != 2 or data.shape[1] < 6:
+                    return None
+                if np.isnan(data).any() or np.isinf(data).any():
+                    return None
+                if data[:, 5].sum() < EPS:
+                    return None
+
+                return data   # ✅ 成功
+
+            except requests.exceptions.HTTPError as e:
+                if "451" in str(e):
+                    print(f"  🌐 {url} 地理限制，換域名...")
+                    break
+                print(f"  ⚠️ {symbol} {interval} [{url}] 第{attempt+1}次失敗：{e}")
+                if attempt < retries - 1:
+                    time.sleep(1)
+
+            except Exception as e:
+                print(f"  ⚠️ {symbol} {interval} [{url}] 第{attempt+1}次失敗：{e}")
+                if attempt < retries - 1:
+                    time.sleep(1)
+
+    print(f"  ❌ {symbol} {interval} 所有域名均失敗")
     return None
 
 
@@ -1014,26 +1056,48 @@ def fetch_fear_greed() -> dict:
     except Exception: return {"value":-1,"label":"無法取得"}
 
 
-def fetch_funding_rate(symbol:str) -> dict:
-    try:
-        r=requests.get(f"{FUTURES_URL}/premiumIndex",params={"symbol":f"{symbol}USDT"},timeout=8); r.raise_for_status()
-        rate=round(float(r.json()["lastFundingRate"])*100,4)
-        sig="多方擁擠⚠️" if rate>0.1 else ("空方擁擠⚠️" if rate<-0.1 else "市場平衡✅")
-        return {"rate":rate,"signal":sig}
-    except Exception: return {"rate":0.0,"signal":"無法取得"}
+def fetch_funding_rate(symbol: str) -> dict:
+    for base in FUTURES_BASE_URLS:
+        try:
+            r = requests.get(f"{base}/premiumIndex",
+                             params={"symbol": f"{symbol}USDT"}, timeout=8)
+            if r.status_code == 451:
+                continue
+            r.raise_for_status()
+            rate = round(float(r.json()["lastFundingRate"]) * 100, 4)
+            sig  = "多方擁擠⚠️" if rate > 0.1 else ("空方擁擠⚠️" if rate < -0.1 else "市場平衡✅")
+            return {"rate": rate, "signal": sig}
+        except Exception:
+            continue
+    return {"rate": 0.0, "signal": "無法取得"}
 
 
-def fetch_open_interest(symbol:str) -> dict:
-    try:
-        r1=requests.get(f"{FUTURES_URL}/openInterest",params={"symbol":f"{symbol}USDT"},timeout=8); r1.raise_for_status()
-        ci=float(r1.json()["openInterest"])
-        r2=requests.get(f"{FUTURES_URL}/openInterestHist",params={"symbol":f"{symbol}USDT","period":"1h","limit":2},timeout=8); r2.raise_for_status()
-        hist=r2.json(); oc=0.0
-        if isinstance(hist,list) and len(hist)>=2:
-            prev=float(hist[0]["sumOpenInterest"]); oc=round((ci-prev)/max(prev,EPS)*100,2)
-        sig="OI急增📈" if oc>2 else ("OI急減📉" if oc<-2 else "OI穩定➡️")
-        return {"oi":round(ci,2),"oi_change":oc,"oi_signal":sig}
-    except Exception: return {"oi":0.0,"oi_change":0.0,"oi_signal":"無法取得"}
+def fetch_open_interest(symbol: str) -> dict:
+    for base in FUTURES_BASE_URLS:
+        try:
+            r1 = requests.get(f"{base}/openInterest",
+                              params={"symbol": f"{symbol}USDT"}, timeout=8)
+            if r1.status_code == 451:
+                continue
+            r1.raise_for_status()
+            ci = float(r1.json()["openInterest"])
+
+            r2 = requests.get(f"{base}/openInterestHist",
+                              params={"symbol": f"{symbol}USDT", "period": "1h", "limit": 2},
+                              timeout=8)
+            if r2.status_code == 451:
+                continue
+            r2.raise_for_status()
+            hist = r2.json()
+            oc   = 0.0
+            if isinstance(hist, list) and len(hist) >= 2:
+                prev = float(hist[0]["sumOpenInterest"])
+                oc   = round((ci - prev) / max(prev, EPS) * 100, 2)
+            sig = "OI急增📈" if oc > 2 else ("OI急減📉" if oc < -2 else "OI穩定➡️")
+            return {"oi": round(ci, 2), "oi_change": oc, "oi_signal": sig}
+        except Exception:
+            continue
+    return {"oi": 0.0, "oi_change": 0.0, "oi_signal": "無法取得"}
 
 
 # ──────────────────────────────────────────────
