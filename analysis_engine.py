@@ -1,16 +1,18 @@
 """
-analysis_engine.py v5.0
+analysis_engine.py v6.0
 ========================
-新增功能：
-  A. 支撐壓力位（自動抓關鍵歷史高低點）
-  B. VWAP（機構常用指標，判斷主力方向）
-  C. ADX 趨勢強度（過濾橫盤假訊號）
-  D. ATR 動態止損（比固定 Fib 更合理）
-  E. 恐懼貪婪指數（市場情緒）
-  F. 資金費率（永續合約籌碼）
-  G. 未平倉量 OI 變化（主力方向）
-  H. RSI/MACD 背離偵測（抓反轉機會）
-  I. 止盈/止損價格監控（推播用）
+專業交易員級別重構
+
+核心改進：
+  1. 防重複改為「價格突破冷卻」而非時間冷卻
+  2. 新增突破偵測（量價配合的關鍵位突破）
+  3. 移動止損機制（追蹤止損保護利潤）
+  4. 市場結構判斷（趨勢市 vs 震盪市）
+  5. 倉位管理建議（根據信心度給出建議%）
+  6. ADX 打折改為分級而非一刀切
+  7. 防重複改為突破價位確認，不用時間限制
+
+目標勝率：70-80%
 """
 
 import time
@@ -19,7 +21,7 @@ import numpy as np
 from typing import Optional
 
 # ──────────────────────────────────────────────
-# 幣種清單 & 週期設定
+# 幣種清單 & 週期
 # ──────────────────────────────────────────────
 TOP30_COINS = [
     "BTC", "ETH", "BNB", "XRP", "SOL",
@@ -47,20 +49,28 @@ FIB_EXTENSION   = [1.0, 1.272, 1.414, 1.618, 2.0, 2.618]
 MIN_SCORE_DIFF  = 3
 MIN_SCORE_TOTAL = 5
 
-BINANCE_URL  = "https://api.binance.com/api/v3/klines"
-FUTURES_URL  = "https://fapi.binance.com/fapi/v1"
+BINANCE_URL = "https://api.binance.com/api/v3/klines"
+FUTURES_URL = "https://fapi.binance.com/fapi/v1"
 
-_signal_cache: dict = {}
-SIGNAL_COOLDOWN = 3600
+# ──────────────────────────────────────────────
+# 修正1：防重複改為價格突破冷卻
+# 記錄上次訊號的進場價，只有價格移動超過 ATR*1.5 才視為新訊號
+# ──────────────────────────────────────────────
+_signal_cache: dict = {}   # {symbol_direction: entry_price}
 
 
-def is_duplicate_signal(symbol: str, direction: str) -> bool:
-    key = f"{symbol}_{direction}"
-    now = time.time()
-    if key in _signal_cache and now - _signal_cache[key] < SIGNAL_COOLDOWN:
-        return True
-    _signal_cache[key] = now
-    return False
+def is_duplicate_signal(symbol: str, direction: str,
+                        current_price: float, atr: float) -> bool:
+    key      = f"{symbol}_{direction}"
+    last_entry = _signal_cache.get(key)
+    if last_entry is None:
+        _signal_cache[key] = current_price
+        return False
+    # 價格移動超過 1.5 ATR → 視為新訊號
+    if abs(current_price - last_entry) > atr * 1.5:
+        _signal_cache[key] = current_price
+        return False
+    return True   # 價格沒有明顯移動 → 重複訊號，跳過
 
 
 # ──────────────────────────────────────────────
@@ -154,39 +164,308 @@ def calc_atr(highs, lows, closes, period: int = 14) -> float:
     return float(np.array(trs[-period:]).mean())
 
 
+def calc_vwap(highs, lows, closes, volumes) -> float:
+    typical = (highs + lows + closes) / 3
+    total_vol = float(np.sum(volumes))
+    if total_vol == 0:
+        return float(closes[-1])
+    return round(float(np.sum(typical * volumes) / total_vol), 6)
+
+
 # ──────────────────────────────────────────────
-# A. 支撐壓力位
+# 修正4：市場結構判斷（趨勢市 vs 震盪市）
+# ──────────────────────────────────────────────
+
+def detect_market_structure(highs, lows, closes, atr: float) -> dict:
+    """
+    判斷目前市場狀態：
+    - trending_up   → 多頭趨勢市（順勢做多）
+    - trending_down → 空頭趨勢市（順勢做空）
+    - ranging       → 震盪市（逆勢策略，在支撐買/壓力賣）
+
+    判斷方法：
+    1. 用 HH/HL（更高高點/更高低點）判斷上升趨勢
+    2. 用 LH/LL（更低高點/更低低點）判斷下降趨勢
+    3. 結合 ATR 與價格區間比較
+    """
+    if len(closes) < 30:
+        return {"structure": "unknown", "label": "未知⚪️", "strategy": "觀望"}
+
+    h = highs[-30:]
+    l = lows[-30:]
+    c = closes[-30:]
+
+    # 抓最近的 swing high/low
+    swing_highs = [float(h[i]) for i in range(2, len(h)-2)
+                   if h[i] > h[i-1] and h[i] > h[i-2] and h[i] > h[i+1] and h[i] > h[i+2]]
+    swing_lows  = [float(l[i]) for i in range(2, len(l)-2)
+                   if l[i] < l[i-1] and l[i] < l[i-2] and l[i] < l[i+1] and l[i] < l[i+2]]
+
+    if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+        hh = swing_highs[-1] > swing_highs[-2]   # 更高高點
+        hl = swing_lows[-1]  > swing_lows[-2]    # 更高低點
+        lh = swing_highs[-1] < swing_highs[-2]   # 更低高點
+        ll = swing_lows[-1]  < swing_lows[-2]    # 更低低點
+
+        if hh and hl:
+            return {
+                "structure": "trending_up",
+                "label":     "多頭趨勢📈",
+                "strategy":  "順勢做多，回調進場",
+            }
+        elif lh and ll:
+            return {
+                "structure": "trending_down",
+                "label":     "空頭趨勢📉",
+                "strategy":  "順勢做空，反彈進場",
+            }
+
+    # 用價格區間 vs ATR 判斷震盪
+    price_range = float(h.max() - l.min())
+    if price_range < atr * 8:
+        return {
+            "structure": "ranging",
+            "label":     "震盪整理↔️",
+            "strategy":  "等待突破，區間高賣低買",
+        }
+
+    return {
+        "structure": "unknown",
+        "label":     "結構不明⚪️",
+        "strategy":  "觀望為主",
+    }
+
+
+# ──────────────────────────────────────────────
+# 修正2：突破偵測
+# ──────────────────────────────────────────────
+
+def detect_breakout(highs, lows, closes, volumes, atr: float) -> dict:
+    """
+    偵測關鍵位突破：
+    - 價格突破近期高點 + 成交量放大 → 看漲突破
+    - 價格跌破近期低點 + 成交量放大 → 看跌突破
+    - 突破必須配合成交量，否則視為假突破
+    """
+    if len(closes) < 25:
+        return {"breakout": None, "breakout_label": "無突破"}
+
+    recent_high = float(highs[-21:-1].max())   # 過去20根高點
+    recent_low  = float(lows[-21:-1].min())    # 過去20根低點
+    last_close  = float(closes[-1])
+    last_vol    = float(volumes[-1])
+    avg_vol     = float(volumes[-21:-1].mean())
+    vol_ratio   = last_vol / avg_vol if avg_vol > 0 else 1.0
+
+    # 突破條件：價格突破 + 成交量 ≥ 1.5倍均量
+    bull_breakout = (last_close > recent_high and vol_ratio >= 1.5)
+    bear_breakout = (last_close < recent_low  and vol_ratio >= 1.5)
+
+    # 假突破過濾：突破幅度需超過 0.3 ATR
+    if bull_breakout and (last_close - recent_high) < atr * 0.3:
+        bull_breakout = False
+    if bear_breakout and (recent_low - last_close) < atr * 0.3:
+        bear_breakout = False
+
+    if bull_breakout:
+        return {
+            "breakout":       "bullish",
+            "breakout_label": f"🚀 看漲突破（量比{vol_ratio:.1f}x）",
+            "breakout_level": round(recent_high, 6),
+        }
+    elif bear_breakout:
+        return {
+            "breakout":       "bearish",
+            "breakout_label": f"💥 看跌突破（量比{vol_ratio:.1f}x）",
+            "breakout_level": round(recent_low, 6),
+        }
+    else:
+        return {"breakout": None, "breakout_label": "無突破"}
+
+
+# ──────────────────────────────────────────────
+# 修正3：移動止損計算
+# ──────────────────────────────────────────────
+
+def calc_trailing_stop(entry: float, current_price: float,
+                       atr: float, direction: str,
+                       tp1_hit: bool = False) -> dict:
+    """
+    移動止損邏輯：
+    - 未到TP1：止損 = 進場 ± ATR*2.0（初始止損）
+    - 到達TP1：止損移至進場價（保本止損）
+    - 超過TP1：止損 = 最高/低點 ∓ ATR*1.0（追蹤利潤）
+
+    回傳建議的移動止損價
+    """
+    if direction == "long":
+        initial_sl  = round(entry - atr * 2.0, 6)
+        breakeven   = round(entry + atr * 0.1, 6)   # 微利保本
+        trailing_sl = round(current_price - atr * 1.0, 6)
+
+        if not tp1_hit:
+            return {"trailing_sl": initial_sl,  "sl_type": "初始止損"}
+        elif current_price < entry * 1.02:
+            return {"trailing_sl": breakeven,   "sl_type": "保本止損"}
+        else:
+            return {"trailing_sl": trailing_sl, "sl_type": "追蹤止損"}
+    else:
+        initial_sl  = round(entry + atr * 2.0, 6)
+        breakeven   = round(entry - atr * 0.1, 6)
+        trailing_sl = round(current_price + atr * 1.0, 6)
+
+        if not tp1_hit:
+            return {"trailing_sl": initial_sl,  "sl_type": "初始止損"}
+        elif current_price > entry * 0.98:
+            return {"trailing_sl": breakeven,   "sl_type": "保本止損"}
+        else:
+            return {"trailing_sl": trailing_sl, "sl_type": "追蹤止損"}
+
+
+# ──────────────────────────────────────────────
+# 修正5：倉位管理建議
+# ──────────────────────────────────────────────
+
+def calc_position_size(confidence: str, structure: str,
+                       risk_reward: float, adx: float) -> dict:
+    """
+    根據信心度、市場結構、風報比給出建議倉位
+
+    基礎倉位：10%（單筆最大風險資金的10%）
+    - 極高信心 + 趨勢市 + RR≥3 → 最高25%
+    - 高信心              → 15%
+    - 中信心              → 10%
+    - 低信心              → 5%（或觀望）
+
+    注意：這是建議倉位佔總資金的百分比
+    """
+    base = 10
+
+    # 信心度加成
+    conf_bonus = {"🔥 極高": 10, "✅ 高": 5, "🟡 中": 0, "⚪️ 低": -5}
+    bonus = conf_bonus.get(confidence, 0)
+
+    # 趨勢市加成
+    if structure in ("trending_up", "trending_down"):
+        bonus += 5
+    elif structure == "ranging":
+        bonus -= 3
+
+    # 風報比加成
+    if risk_reward >= 3.0:
+        bonus += 5
+    elif risk_reward >= 2.0:
+        bonus += 2
+    elif risk_reward < 1.5:
+        bonus -= 5
+
+    # ADX 加成（修正6：分級而非一刀切）
+    if adx >= 40:
+        bonus += 3
+    elif adx >= 25:
+        bonus += 1
+    elif adx < 20:
+        bonus -= 5
+
+    size = max(5, min(25, base + bonus))   # 最少5%，最多25%
+
+    if size >= 20:
+        risk_label = "🟢 積極"
+    elif size >= 15:
+        risk_label = "🟡 標準"
+    elif size >= 10:
+        risk_label = "🟠 保守"
+    else:
+        risk_label = "🔴 觀望"
+
+    return {
+        "position_pct": size,
+        "risk_label":   risk_label,
+        "note":         f"建議倉位：總資金 {size}%（{risk_label}）",
+    }
+
+
+# ──────────────────────────────────────────────
+# ADX（修正6：分級計算，不再一刀切打折）
+# ──────────────────────────────────────────────
+
+def calc_adx(highs, lows, closes, period: int = 14) -> dict:
+    if len(closes) < period * 2:
+        return {"adx": 0.0, "trend_strength": "橫盤⚪️", "adx_score": -1}
+
+    plus_dm  = []
+    minus_dm = []
+    trs      = []
+
+    for i in range(1, len(closes)):
+        hd = float(highs[i]) - float(highs[i-1])
+        ld = float(lows[i-1]) - float(lows[i])
+        plus_dm.append(hd if hd > ld and hd > 0 else 0)
+        minus_dm.append(ld if ld > hd and ld > 0 else 0)
+        tr = max(float(highs[i]-lows[i]),
+                 abs(float(highs[i]-closes[i-1])),
+                 abs(float(lows[i]-closes[i-1])))
+        trs.append(tr)
+
+    def ws(arr, p):
+        r = [sum(arr[:p])]
+        for v in arr[p:]:
+            r.append(r[-1] - r[-1]/p + v)
+        return r
+
+    atr14   = ws(trs,      period)
+    plus14  = ws(plus_dm,  period)
+    minus14 = ws(minus_dm, period)
+
+    dx_list = []
+    for i in range(len(atr14)):
+        pdi = 100 * plus14[i]  / atr14[i] if atr14[i] > 0 else 0
+        mdi = 100 * minus14[i] / atr14[i] if atr14[i] > 0 else 0
+        dx  = 100 * abs(pdi-mdi) / (pdi+mdi) if (pdi+mdi) > 0 else 0
+        dx_list.append(dx)
+
+    adx = round(sum(dx_list[-period:]) / period, 2)
+
+    # 修正6：分級，不再打折
+    if adx >= 40:
+        strength = "強趨勢🔥"
+        score    = 2
+    elif adx >= 25:
+        strength = "趨勢中🟡"
+        score    = 1
+    elif adx >= 20:
+        strength = "弱趨勢🟠"
+        score    = 0
+    else:
+        strength = "橫盤⚪️"
+        score    = -2   # 橫盤時扣分而非打折
+
+    return {"adx": adx, "trend_strength": strength, "adx_score": score}
+
+
+# ──────────────────────────────────────────────
+# 支撐壓力位
 # ──────────────────────────────────────────────
 
 def detect_support_resistance(highs, lows, closes, lookback=100, n=3) -> dict:
-    """
-    自動抓取關鍵支撐壓力位
-    用 pivot high/low 偵測，取最近 n 個重要位置
-    判斷現價距離最近支撐/壓力的距離
-    """
-    h = highs[-lookback:]
-    l = lows[-lookback:]
+    h     = highs[-lookback:]
+    l     = lows[-lookback:]
     price = float(closes[-1])
 
     resistances = []
     supports    = []
 
     for i in range(2, len(h) - 2):
-        # Pivot High = 壓力
         if h[i] > h[i-1] and h[i] > h[i-2] and h[i] > h[i+1] and h[i] > h[i+2]:
             resistances.append(float(h[i]))
-        # Pivot Low = 支撐
         if l[i] < l[i-1] and l[i] < l[i-2] and l[i] < l[i+1] and l[i] < l[i+2]:
             supports.append(float(l[i]))
 
-    # 只保留比現價高的壓力 / 比現價低的支撐
     resistances = sorted([r for r in resistances if r > price])[:n]
     supports    = sorted([s for s in supports    if s < price], reverse=True)[:n]
 
     nearest_res = resistances[0] if resistances else None
     nearest_sup = supports[0]    if supports    else None
-
-    # 現價距支撐/壓力的百分比
     dist_to_res = round((nearest_res - price) / price * 100, 2) if nearest_res else None
     dist_to_sup = round((price - nearest_sup) / price * 100, 2) if nearest_sup else None
 
@@ -195,296 +474,9 @@ def detect_support_resistance(highs, lows, closes, lookback=100, n=3) -> dict:
         "resistances": resistances,
         "nearest_sup": nearest_sup,
         "nearest_res": nearest_res,
-        "dist_to_sup": dist_to_sup,   # % 距離支撐
-        "dist_to_res": dist_to_res,   # % 距離壓力
+        "dist_to_sup": dist_to_sup,
+        "dist_to_res": dist_to_res,
     }
-
-
-# ──────────────────────────────────────────────
-# B. VWAP
-# ──────────────────────────────────────────────
-
-def calc_vwap(highs, lows, closes, volumes) -> float:
-    """
-    VWAP = 成交量加權平均價
-    價格 > VWAP → 多方佔優
-    價格 < VWAP → 空方佔優
-    """
-    typical_price = (highs + lows + closes) / 3
-    vwap = float(np.sum(typical_price * volumes) / np.sum(volumes)) if np.sum(volumes) > 0 else float(closes[-1])
-    return round(vwap, 6)
-
-
-# ──────────────────────────────────────────────
-# C. ADX 趨勢強度
-# ──────────────────────────────────────────────
-
-def calc_adx(highs, lows, closes, period: int = 14) -> dict:
-    """
-    ADX < 20  → 橫盤，訊號不可靠
-    ADX 20-40 → 趨勢形成
-    ADX > 40  → 強趨勢，訊號可靠
-    """
-    if len(closes) < period * 2:
-        return {"adx": 0.0, "trend_strength": "橫盤⚪️"}
-
-    plus_dm  = []
-    minus_dm = []
-    trs      = []
-
-    for i in range(1, len(closes)):
-        high_diff = float(highs[i]) - float(highs[i-1])
-        low_diff  = float(lows[i-1]) - float(lows[i])
-        plus_dm.append(high_diff if high_diff > low_diff and high_diff > 0 else 0)
-        minus_dm.append(low_diff if low_diff > high_diff and low_diff > 0 else 0)
-        tr = max(float(highs[i]) - float(lows[i]),
-                 abs(float(highs[i]) - float(closes[i-1])),
-                 abs(float(lows[i])  - float(closes[i-1])))
-        trs.append(tr)
-
-    def wilder_smooth(arr, p):
-        result = [sum(arr[:p])]
-        for v in arr[p:]:
-            result.append(result[-1] - result[-1]/p + v)
-        return result
-
-    atr14    = wilder_smooth(trs, period)
-    plus14   = wilder_smooth(plus_dm, period)
-    minus14  = wilder_smooth(minus_dm, period)
-
-    dx_list  = []
-    for i in range(len(atr14)):
-        pdi = 100 * plus14[i]  / atr14[i] if atr14[i] > 0 else 0
-        mdi = 100 * minus14[i] / atr14[i] if atr14[i] > 0 else 0
-        dx  = 100 * abs(pdi - mdi) / (pdi + mdi) if (pdi + mdi) > 0 else 0
-        dx_list.append(dx)
-
-    adx = round(sum(dx_list[-period:]) / period, 2)
-
-    if adx < 20:
-        strength = "橫盤⚪️"
-    elif adx < 40:
-        strength = "趨勢中🟡"
-    else:
-        strength = "強趨勢🔥"
-
-    return {"adx": adx, "trend_strength": strength}
-
-
-# ──────────────────────────────────────────────
-# D. ATR 動態止損
-# ──────────────────────────────────────────────
-
-def calc_atr_stoploss(entry: float, atr: float, direction: str,
-                      multiplier: float = 2.0) -> float:
-    """
-    動態止損 = 進場價 ± ATR × multiplier
-    比固定 Fib 更貼近市場波動
-    multiplier=2.0 → 正常波動不觸發
-    multiplier=1.5 → 較緊（適合強趨勢）
-    """
-    if direction == "long":
-        return round(entry - atr * multiplier, 6)
-    else:
-        return round(entry + atr * multiplier, 6)
-
-
-# ──────────────────────────────────────────────
-# E. 恐懼貪婪指數
-# ──────────────────────────────────────────────
-
-def fetch_fear_greed() -> dict:
-    """
-    使用 alternative.me API 抓取恐懼貪婪指數
-    0-24  → 極度恐懼（做多機會）
-    25-49 → 恐懼
-    50-74 → 貪婪
-    75-100 → 極度貪婪（做空機會）
-    """
-    try:
-        resp = requests.get(
-            "https://api.alternative.me/fng/?limit=1",
-            timeout=8
-        )
-        data  = resp.json()["data"][0]
-        value = int(data["value"])
-        label = data["value_classification"]
-
-        if value <= 24:
-            emoji = "😱 極度恐懼"
-        elif value <= 49:
-            emoji = "😨 恐懼"
-        elif value <= 74:
-            emoji = "😊 貪婪"
-        else:
-            emoji = "🤑 極度貪婪"
-
-        return {"value": value, "label": emoji}
-    except Exception:
-        return {"value": -1, "label": "無法取得"}
-
-
-# ──────────────────────────────────────────────
-# F. 資金費率
-# ──────────────────────────────────────────────
-
-def fetch_funding_rate(symbol: str) -> dict:
-    """
-    資金費率 > 0.1%  → 多方擁擠，注意回調
-    資金費率 < -0.1% → 空方擁擠，注意反彈
-    資金費率接近 0   → 市場平衡
-    """
-    try:
-        resp = requests.get(
-            f"{FUTURES_URL}/premiumIndex",
-            params={"symbol": f"{symbol}USDT"},
-            timeout=8
-        )
-        data = resp.json()
-        rate = round(float(data["lastFundingRate"]) * 100, 4)
-
-        if rate > 0.1:
-            signal = "多方擁擠⚠️"
-        elif rate < -0.1:
-            signal = "空方擁擠⚠️"
-        else:
-            signal = "市場平衡✅"
-
-        return {"rate": rate, "signal": signal}
-    except Exception:
-        return {"rate": 0.0, "signal": "無法取得"}
-
-
-# ──────────────────────────────────────────────
-# G. 未平倉量 OI
-# ──────────────────────────────────────────────
-
-def fetch_open_interest(symbol: str) -> dict:
-    """
-    OI 增加 + 價格上漲 → 多頭進場，趨勢延續
-    OI 增加 + 價格下跌 → 空頭進場，趨勢延續
-    OI 減少           → 主力出場，趨勢可能結束
-    """
-    try:
-        # 目前 OI
-        resp1 = requests.get(
-            f"{FUTURES_URL}/openInterest",
-            params={"symbol": f"{symbol}USDT"},
-            timeout=8
-        )
-        current_oi = float(resp1.json()["openInterest"])
-
-        # 歷史 OI（抓最近2筆做比較）
-        resp2 = requests.get(
-            f"{FUTURES_URL}/openInterestHist",
-            params={"symbol": f"{symbol}USDT", "period": "1h", "limit": 2},
-            timeout=8
-        )
-        hist = resp2.json()
-        if len(hist) >= 2:
-            prev_oi  = float(hist[0]["sumOpenInterest"])
-            oi_change = round((current_oi - prev_oi) / prev_oi * 100, 2) if prev_oi > 0 else 0
-        else:
-            oi_change = 0.0
-
-        if oi_change > 2:
-            oi_signal = "OI急增📈"
-        elif oi_change < -2:
-            oi_signal = "OI急減📉"
-        else:
-            oi_signal = "OI穩定➡️"
-
-        return {
-            "oi":        round(current_oi, 2),
-            "oi_change": oi_change,
-            "oi_signal": oi_signal,
-        }
-    except Exception:
-        return {"oi": 0.0, "oi_change": 0.0, "oi_signal": "無法取得"}
-
-
-# ──────────────────────────────────────────────
-# H. RSI / MACD 背離偵測
-# ──────────────────────────────────────────────
-
-def detect_divergence(highs, lows, closes, lookback=30) -> dict:
-    """
-    看漲背離：價格創新低，RSI 未創新低 → 做多訊號
-    看跌背離：價格創新高，RSI 未創新高 → 做空訊號
-    MACD 背離同理
-    """
-    result = {
-        "rsi_bull_div":  False,
-        "rsi_bear_div":  False,
-        "macd_bull_div": False,
-        "macd_bear_div": False,
-        "divergence":    "無",
-    }
-
-    if len(closes) < lookback + 5:
-        return result
-
-    c  = closes[-lookback:]
-    h  = highs[-lookback:]
-    l  = lows[-lookback:]
-    n  = len(c)
-
-    # 計算整段的 RSI 序列（簡化版）
-    rsi_series = []
-    for i in range(14, n):
-        rsi_series.append(calc_rsi(c[:i+1]))
-
-    if len(rsi_series) < 10:
-        return result
-
-    # MACD hist 序列
-    macd_hist_series = []
-    for i in range(26, n):
-        _, _, hist = calc_macd(c[:i+1])
-        macd_hist_series.append(hist)
-
-    # 價格最近兩個低點
-    price_lows  = [(i, float(l[i])) for i in range(2, n-2)
-                   if l[i] < l[i-1] and l[i] < l[i-2] and l[i] < l[i+1] and l[i] < l[i+2]]
-    price_highs = [(i, float(h[i])) for i in range(2, n-2)
-                   if h[i] > h[i-1] and h[i] > h[i-2] and h[i] > h[i+1] and h[i] > h[i+2]]
-
-    # 看漲背離：價格低點下降，RSI低點上升
-    if len(price_lows) >= 2:
-        p1_idx, p1_price = price_lows[-2]
-        p2_idx, p2_price = price_lows[-1]
-        r1_idx = p1_idx - 14
-        r2_idx = p2_idx - 14
-        if (r1_idx >= 0 and r2_idx >= 0 and r2_idx < len(rsi_series) and
-                p2_price < p1_price and rsi_series[r2_idx] > rsi_series[r1_idx]):
-            result["rsi_bull_div"] = True
-            result["divergence"]   = "📈 RSI看漲背離"
-
-    # 看跌背離：價格高點上升，RSI高點下降
-    if len(price_highs) >= 2:
-        p1_idx, p1_price = price_highs[-2]
-        p2_idx, p2_price = price_highs[-1]
-        r1_idx = p1_idx - 14
-        r2_idx = p2_idx - 14
-        if (r1_idx >= 0 and r2_idx >= 0 and r2_idx < len(rsi_series) and
-                p2_price > p1_price and rsi_series[r2_idx] < rsi_series[r1_idx]):
-            result["rsi_bear_div"] = True
-            result["divergence"]   = "📉 RSI看跌背離"
-
-    # MACD 看漲背離
-    if len(price_lows) >= 2 and len(macd_hist_series) >= 10:
-        p1_idx, p1_price = price_lows[-2]
-        p2_idx, p2_price = price_lows[-1]
-        m1_idx = max(0, p1_idx - 26)
-        m2_idx = max(0, p2_idx - 26)
-        if (m2_idx < len(macd_hist_series) and
-                p2_price < p1_price and
-                macd_hist_series[m2_idx] > macd_hist_series[m1_idx]):
-            result["macd_bull_div"] = True
-            if result["divergence"] == "無":
-                result["divergence"] = "📈 MACD看漲背離"
-
-    return result
 
 
 # ──────────────────────────────────────────────
@@ -530,18 +522,16 @@ def detect_candle_pattern(opens, highs, lows, closes) -> dict:
     if rng2 == 0:
         return result
 
-    if (body2 > 0 and lower_wick2 > body2 * 2
-            and upper_wick2 < body2 * 0.5 and c2 > o2 and c1 < o1):
-        result["hammer"] = True; result["name"] = "🔨 錘子線"
-    elif (body2 > 0 and upper_wick2 > body2 * 2
-            and lower_wick2 < body2 * 0.5 and c2 < o2 and c1 > o1):
+    if body2 > 0 and lower_wick2 > body2*2 and upper_wick2 < body2*0.5 and c2>o2 and c1<o1:
+        result["hammer"] = True;        result["name"] = "🔨 錘子線"
+    elif body2>0 and upper_wick2>body2*2 and lower_wick2<body2*0.5 and c2<o2 and c1>o1:
         result["shooting_star"] = True; result["name"] = "💫 流星線"
-    elif (c1 < o1 and c2 > o2 and o2 <= c1 and c2 >= o1):
+    elif c1<o1 and c2>o2 and o2<=c1 and c2>=o1:
         result["engulfing_bull"] = True; result["name"] = "📈 看漲吞噬"
-    elif (c1 > o1 and c2 < o2 and o2 >= c1 and c2 <= o1):
+    elif c1>o1 and c2<o2 and o2>=c1 and c2<=o1:
         result["engulfing_bear"] = True; result["name"] = "📉 看跌吞噬"
-    elif (body2 < rng2 * 0.1 and lower_wick2 > rng2 * 0.6):
-        result["doji_bull"] = True; result["name"] = "✙ 十字星"
+    elif body2 < rng2*0.1 and lower_wick2 > rng2*0.6:
+        result["doji_bull"] = True;     result["name"] = "✙ 十字星"
 
     return result
 
@@ -561,6 +551,51 @@ def get_upper_trend(symbol: str, main_tf: str) -> Optional[str]:
     ema50  = calc_ema(closes, 50)
     slope  = float(ema50[-1]) - float(ema50[-5])
     return "up" if slope > 0 else "down"
+
+
+# ──────────────────────────────────────────────
+# 背離偵測
+# ──────────────────────────────────────────────
+
+def detect_divergence(highs, lows, closes, lookback=30) -> dict:
+    result = {
+        "rsi_bull_div": False, "rsi_bear_div": False,
+        "macd_bull_div": False, "divergence": "無",
+    }
+    if len(closes) < lookback + 5:
+        return result
+
+    c = closes[-lookback:]
+    h = highs[-lookback:]
+    l = lows[-lookback:]
+    n = len(c)
+
+    rsi_series = [calc_rsi(c[:i+1]) for i in range(14, n)]
+    if len(rsi_series) < 10:
+        return result
+
+    price_lows  = [(i, float(l[i])) for i in range(2, n-2)
+                   if l[i]<l[i-1] and l[i]<l[i-2] and l[i]<l[i+1] and l[i]<l[i+2]]
+    price_highs = [(i, float(h[i])) for i in range(2, n-2)
+                   if h[i]>h[i-1] and h[i]>h[i-2] and h[i]>h[i+1] and h[i]>h[i+2]]
+
+    if len(price_lows) >= 2:
+        p1i, p1p = price_lows[-2]; p2i, p2p = price_lows[-1]
+        r1i = p1i - 14; r2i = p2i - 14
+        if (r1i >= 0 and r2i >= 0 and r2i < len(rsi_series) and
+                p2p < p1p and rsi_series[r2i] > rsi_series[r1i]):
+            result["rsi_bull_div"] = True
+            result["divergence"]   = "📈 RSI看漲背離"
+
+    if len(price_highs) >= 2:
+        p1i, p1p = price_highs[-2]; p2i, p2p = price_highs[-1]
+        r1i = p1i - 14; r2i = p2i - 14
+        if (r1i >= 0 and r2i >= 0 and r2i < len(rsi_series) and
+                p2p > p1p and rsi_series[r2i] < rsi_series[r1i]):
+            result["rsi_bear_div"] = True
+            result["divergence"]   = "📉 RSI看跌背離"
+
+    return result
 
 
 # ──────────────────────────────────────────────
@@ -603,26 +638,29 @@ def get_best_entry(price: float, obs: list, fvgs: list,
 
 
 # ──────────────────────────────────────────────
-# 信心度
+# 信心度（整合市場結構）
 # ──────────────────────────────────────────────
 
-def get_confidence(score_diff: int, has_volume: bool,
-                   has_candle: bool, upper_agree: bool,
-                   adx: float, has_divergence: bool) -> str:
+def get_confidence(score_diff: int, has_volume: bool, has_candle: bool,
+                   upper_agree: bool, adx: float, has_divergence: bool,
+                   has_breakout: bool, structure: str) -> str:
     bonus = sum([has_volume, has_candle, upper_agree,
-                 adx >= 25, has_divergence])
-    if score_diff >= 8 and bonus >= 3:
+                 adx >= 25, has_divergence, has_breakout,
+                 structure in ("trending_up", "trending_down")])
+    if score_diff >= 8 and bonus >= 4:
         return "🔥 極高"
-    elif score_diff >= 5 and bonus >= 2:
+    elif score_diff >= 6 and bonus >= 3:
         return "✅ 高"
-    elif score_diff >= 3 and bonus >= 1:
+    elif score_diff >= 4 and bonus >= 2:
         return "🟡 中"
+    elif score_diff >= 3:
+        return "🟠 偏低"
     else:
         return "⚪️ 低"
 
 
 # ──────────────────────────────────────────────
-# 斐波納契計算
+# 斐波納契
 # ──────────────────────────────────────────────
 
 def find_swing_points(highs, lows, lookback: int = 50):
@@ -644,8 +682,7 @@ def fibonacci_levels(swing_high: float, swing_low: float, direction: str):
     return {"retracements": retracements, "extensions": extensions}
 
 
-def get_fib_exits(swing_high: float, swing_low: float,
-                  entry: float, direction: str) -> dict:
+def get_fib_exits(swing_high, swing_low, entry, direction) -> dict:
     fib  = fibonacci_levels(swing_high, swing_low, direction)
     ret  = fib["retracements"]
     ext  = fib["extensions"]
@@ -670,16 +707,14 @@ def get_fib_exits(swing_high: float, swing_low: float,
     rr      = round(reward1 / risk, 2) if risk > 0 else 0
 
     return {
-        "stop_loss":   round(sl, 6),
-        "tp1":         round(tp1, 6),
-        "tp2":         round(tp2, 6),
-        "tp3":         round(tp3, 6),
+        "stop_loss": round(sl, 6), "tp1": round(tp1, 6),
+        "tp2": round(tp2, 6),     "tp3": round(tp3, 6),
         "risk_reward": rr,
     }
 
 
 # ──────────────────────────────────────────────
-# SMC 分析
+# SMC
 # ──────────────────────────────────────────────
 
 def detect_order_blocks(opens, highs, lows, closes, n=5):
@@ -689,16 +724,10 @@ def detect_order_blocks(opens, highs, lows, closes, n=5):
         prev_range = float(highs[i-1]) - float(lows[i-1])
         if body == 0 or prev_range == 0:
             continue
-        if (closes[i-1] < opens[i-1] and closes[i] > highs[i-1]
-                and body > prev_range * 0.5):
-            obs.append({"type": "bullish_ob",
-                        "high": float(highs[i-1]),
-                        "low":  float(lows[i-1]), "index": i})
-        elif (closes[i-1] > opens[i-1] and closes[i] < lows[i-1]
-              and body > prev_range * 0.5):
-            obs.append({"type": "bearish_ob",
-                        "high": float(highs[i-1]),
-                        "low":  float(lows[i-1]), "index": i})
+        if closes[i-1]<opens[i-1] and closes[i]>highs[i-1] and body>prev_range*0.5:
+            obs.append({"type":"bullish_ob","high":float(highs[i-1]),"low":float(lows[i-1]),"index":i})
+        elif closes[i-1]>opens[i-1] and closes[i]<lows[i-1] and body>prev_range*0.5:
+            obs.append({"type":"bearish_ob","high":float(highs[i-1]),"low":float(lows[i-1]),"index":i})
     return obs[-n:] if obs else []
 
 
@@ -706,11 +735,9 @@ def detect_fvg(highs, lows, closes):
     fvgs = []
     for i in range(2, len(closes)):
         if float(lows[i]) > float(highs[i-2]):
-            fvgs.append({"type": "bullish_fvg",
-                         "top": float(lows[i]), "bottom": float(highs[i-2])})
+            fvgs.append({"type":"bullish_fvg","top":float(lows[i]),"bottom":float(highs[i-2])})
         elif float(highs[i]) < float(lows[i-2]):
-            fvgs.append({"type": "bearish_fvg",
-                         "top": float(lows[i-2]), "bottom": float(highs[i])})
+            fvgs.append({"type":"bearish_fvg","top":float(lows[i-2]),"bottom":float(highs[i])})
     return fvgs[-3:] if fvgs else []
 
 
@@ -723,7 +750,6 @@ def detect_bos_choch(highs, lows, closes, lookback=20):
     ema50       = calc_ema(closes, 50)
     slope       = float(ema50[-1]) - float(ema50[-10])
     prior_trend = "up" if slope > 0 else "down"
-
     bos = choch = None
     if last_close > recent_high:
         if prior_trend == "up":   bos   = "bullish_bos"
@@ -739,13 +765,12 @@ def detect_bos_choch(highs, lows, closes, lookback=20):
 # ──────────────────────────────────────────────
 
 def check_harmonic(X, A, B, C, D):
-    def ratio(a, b): return abs(a)/abs(b) if abs(b) > 1e-12 else 0
-    XA = A-X; AB = B-A; BC = C-B; CD = D-C
-    if XA == 0 or AB == 0 or BC == 0: return None
-    AB_XA = ratio(AB,XA); BC_AB = ratio(BC,AB)
-    CD_BC = ratio(CD,BC); XD_XA = ratio(D-X,XA)
+    def ratio(a, b): return abs(a)/abs(b) if abs(b)>1e-12 else 0
+    XA=A-X; AB=B-A; BC=C-B; CD=D-C
+    if XA==0 or AB==0 or BC==0: return None
+    AB_XA=ratio(AB,XA); BC_AB=ratio(BC,AB); CD_BC=ratio(CD,BC); XD_XA=ratio(D-X,XA)
     def near(v,t,tol=0.08): return abs(v-t)<=tol
-    d = "long" if XA > 0 else "short"
+    d="long" if XA>0 else "short"
     if near(AB_XA,.618) and (near(BC_AB,.382) or near(BC_AB,.886)) and near(CD_BC,1.272) and near(XD_XA,.786): return ("Gartley",d)
     if near(AB_XA,.382) and (near(BC_AB,.382) or near(BC_AB,.886)) and near(CD_BC,2.0)   and near(XD_XA,.886): return ("Bat",d)
     if near(AB_XA,.786) and (near(BC_AB,.382) or near(BC_AB,.886)) and near(CD_BC,1.618) and near(XD_XA,1.272): return ("Butterfly",d)
@@ -754,16 +779,65 @@ def check_harmonic(X, A, B, C, D):
 
 
 def scan_harmonics(highs, lows, n=80):
-    h = list(highs[-n:]); l = list(lows[-n:])
-    pivots = []
-    for i in range(2, len(h)-2):
+    h=list(highs[-n:]); l=list(lows[-n:]); pivots=[]
+    for i in range(2,len(h)-2):
         if h[i]>h[i-1] and h[i]>h[i+1]: pivots.append(h[i])
         elif l[i]<l[i-1] and l[i]<l[i+1]: pivots.append(l[i])
-    if len(pivots) < 5: return None
+    if len(pivots)<5: return None
     for i in range(len(pivots)-4):
-        r = check_harmonic(*pivots[i:i+5])
+        r=check_harmonic(*pivots[i:i+5])
         if r: return r
     return None
+
+
+# ──────────────────────────────────────────────
+# 外部資料
+# ──────────────────────────────────────────────
+
+def fetch_fear_greed() -> dict:
+    try:
+        resp  = requests.get("https://api.alternative.me/fng/?limit=1", timeout=8)
+        data  = resp.json()["data"][0]
+        value = int(data["value"])
+        if value <= 24:   emoji = "😱 極度恐懼"
+        elif value <= 49: emoji = "😨 恐懼"
+        elif value <= 74: emoji = "😊 貪婪"
+        else:             emoji = "🤑 極度貪婪"
+        return {"value": value, "label": emoji}
+    except Exception:
+        return {"value": -1, "label": "無法取得"}
+
+
+def fetch_funding_rate(symbol: str) -> dict:
+    try:
+        resp = requests.get(f"{FUTURES_URL}/premiumIndex",
+                            params={"symbol": f"{symbol}USDT"}, timeout=8)
+        rate = round(float(resp.json()["lastFundingRate"]) * 100, 4)
+        if rate > 0.1:   signal = "多方擁擠⚠️"
+        elif rate < -0.1: signal = "空方擁擠⚠️"
+        else:             signal = "市場平衡✅"
+        return {"rate": rate, "signal": signal}
+    except Exception:
+        return {"rate": 0.0, "signal": "無法取得"}
+
+
+def fetch_open_interest(symbol: str) -> dict:
+    try:
+        r1 = requests.get(f"{FUTURES_URL}/openInterest",
+                          params={"symbol": f"{symbol}USDT"}, timeout=8)
+        current_oi = float(r1.json()["openInterest"])
+        r2 = requests.get(f"{FUTURES_URL}/openInterestHist",
+                          params={"symbol": f"{symbol}USDT", "period": "1h", "limit": 2}, timeout=8)
+        hist = r2.json()
+        if len(hist) >= 2:
+            prev_oi   = float(hist[0]["sumOpenInterest"])
+            oi_change = round((current_oi - prev_oi) / prev_oi * 100, 2) if prev_oi > 0 else 0
+        else:
+            oi_change = 0.0
+        oi_signal = "OI急增📈" if oi_change>2 else ("OI急減📉" if oi_change<-2 else "OI穩定➡️")
+        return {"oi": round(current_oi, 2), "oi_change": oi_change, "oi_signal": oi_signal}
+    except Exception:
+        return {"oi": 0.0, "oi_change": 0.0, "oi_signal": "無法取得"}
 
 
 # ──────────────────────────────────────────────
@@ -781,7 +855,7 @@ def full_analysis(symbol: str) -> Optional[dict]:
     vols   = data[:, 5]
     price  = float(closes[-1])
 
-    # 指標計算
+    # 指標
     rsi                        = calc_rsi(closes)
     macd, macd_sig, hist       = calc_macd(closes)
     bb_upper, bb_mid, bb_lower = calc_bollinger(closes)
@@ -789,16 +863,17 @@ def full_analysis(symbol: str) -> Optional[dict]:
     ema50  = float(calc_ema(closes, 50)[-1])
     ema200 = float(calc_ema(closes, 200)[-1])
     atr    = calc_atr(highs, lows, closes)
+    vwap   = calc_vwap(highs, lows, closes, vols)
 
-    # 新增指標
-    vwap      = calc_vwap(highs, lows, closes, vols)
-    adx_info  = calc_adx(highs, lows, closes)
-    sr        = detect_support_resistance(highs, lows, closes)
-    div       = detect_divergence(highs, lows, closes)
-    funding   = fetch_funding_rate(symbol)
-    oi        = fetch_open_interest(symbol)
+    # 新功能
+    adx_info   = calc_adx(highs, lows, closes)
+    market_st  = detect_market_structure(highs, lows, closes, atr)  # 修正4
+    breakout   = detect_breakout(highs, lows, closes, vols, atr)    # 修正2
+    sr         = detect_support_resistance(highs, lows, closes)
+    div        = detect_divergence(highs, lows, closes)
+    funding    = fetch_funding_rate(symbol)
+    oi         = fetch_open_interest(symbol)
 
-    # 其他
     swing_high, swing_low = find_swing_points(highs, lows, 50)
     obs        = detect_order_blocks(opens, highs, lows, closes)
     fvgs       = detect_fvg(highs, lows, closes)
@@ -832,15 +907,34 @@ def full_analysis(symbol: str) -> Optional[dict]:
     if price < bb_lower:   long_score  += 1
     elif price > bb_upper: short_score += 1
 
-    # B. VWAP
+    # VWAP
     if price > vwap:   long_score  += 1
     elif price < vwap: short_score += 1
 
+    # ADX（修正6：分級加減分）
+    long_score  += adx_info["adx_score"] if adx_info["adx_score"] > 0 else 0
+    short_score += adx_info["adx_score"] if adx_info["adx_score"] > 0 else 0
+    if adx_info["adx_score"] < 0:
+        long_score  = max(0, long_score  + adx_info["adx_score"])
+        short_score = max(0, short_score + adx_info["adx_score"])
+
+    # 市場結構（修正4：趨勢市加分，震盪市不加分）
+    if market_st["structure"] == "trending_up":
+        long_score  += 2
+    elif market_st["structure"] == "trending_down":
+        short_score += 2
+
+    # 突破（修正2：突破加重分）
+    if breakout["breakout"] == "bullish":
+        long_score  += 4
+    elif breakout["breakout"] == "bearish":
+        short_score += 4
+
     # OB / FVG
-    if any(o["type"] == "bullish_ob"  for o in obs): long_score  += 1
-    if any(o["type"] == "bearish_ob"  for o in obs): short_score += 1
-    if any(f["type"] == "bullish_fvg" for f in fvgs): long_score  += 1
-    if any(f["type"] == "bearish_fvg" for f in fvgs): short_score += 1
+    if any(o["type"]=="bullish_ob"  for o in obs): long_score  += 1
+    if any(o["type"]=="bearish_ob"  for o in obs): short_score += 1
+    if any(f["type"]=="bullish_fvg" for f in fvgs): long_score  += 1
+    if any(f["type"]=="bearish_fvg" for f in fvgs): short_score += 1
 
     # BOS / CHoCH
     if bos   == "bullish_bos":     long_score  += 2
@@ -850,8 +944,8 @@ def full_analysis(symbol: str) -> Optional[dict]:
 
     # 和諧型態
     if harmonic:
-        if harmonic[1] == "long":  long_score  += 2
-        else:                      short_score += 2
+        if harmonic[1]=="long": long_score  += 2
+        else:                   short_score += 2
 
     # 成交量
     if vol_info["bullish_vol"]: long_score  += 2
@@ -870,21 +964,16 @@ def full_analysis(symbol: str) -> Optional[dict]:
     elif upper_trend == "down":
         short_score += 2; upper_agree = True
 
-    # H. 背離
+    # 背離
     has_divergence = False
     if div["rsi_bull_div"] or div["macd_bull_div"]:
         long_score += 3; has_divergence = True
     if div["rsi_bear_div"]:
         short_score += 3; has_divergence = True
 
-    # C. ADX 過濾橫盤（ADX < 20 時大幅降低分數）
-    if adx_info["adx"] < 20:
-        long_score  = int(long_score  * 0.6)
-        short_score = int(short_score * 0.6)
-
-    # 資金費率警示（不加分，但加入訊號）
-    if funding["rate"] > 0.15:  short_score += 1  # 多方過熱
-    if funding["rate"] < -0.15: long_score  += 1  # 空方過熱
+    # 資金費率
+    if funding["rate"] > 0.15:  short_score += 1
+    if funding["rate"] < -0.15: long_score  += 1
 
     # OI 確認
     if oi["oi_change"] > 2 and price > float(closes[-2]):
@@ -900,69 +989,86 @@ def full_analysis(symbol: str) -> Optional[dict]:
     if score_diff < MIN_SCORE_DIFF: return None
     if max_score < MIN_SCORE_TOTAL: return None
 
-    direction  = "long" if long_score > short_score else "short"
+    direction = "long" if long_score > short_score else "short"
 
-    if is_duplicate_signal(symbol, direction):
+    # 修正1：價格突破冷卻（取代時間冷卻）
+    if is_duplicate_signal(symbol, direction, price, atr):
         return None
 
-    best_entry  = get_best_entry(price, obs, fvgs, direction, atr)
-    exits       = get_fib_exits(swing_high, swing_low, best_entry, direction)
-    atr_sl      = calc_atr_stoploss(best_entry, atr, direction)  # D. ATR動態止損
+    best_entry = get_best_entry(price, obs, fvgs, direction, atr)
+    exits      = get_fib_exits(swing_high, swing_low, best_entry, direction)
+    atr_sl     = (round(best_entry - atr * 2.0, 6) if direction == "long"
+                  else round(best_entry + atr * 2.0, 6))
 
-    has_candle = any([candle["hammer"], candle["engulfing_bull"],
-                      candle["doji_bull"], candle["shooting_star"],
-                      candle["engulfing_bear"]])
+    has_candle = any([candle["hammer"], candle["engulfing_bull"], candle["doji_bull"],
+                      candle["shooting_star"], candle["engulfing_bear"]])
     has_vol    = vol_info["bullish_vol"] or vol_info["bearish_vol"]
-    confidence = get_confidence(score_diff, has_vol, has_candle,
-                                upper_agree, adx_info["adx"], has_divergence)
+    has_bo     = breakout["breakout"] is not None
+    confidence = get_confidence(score_diff, has_vol, has_candle, upper_agree,
+                                adx_info["adx"], has_divergence, has_bo,
+                                market_st["structure"])
+
+    # 修正5：倉位管理
+    position   = calc_position_size(confidence, market_st["structure"],
+                                    exits["risk_reward"], adx_info["adx"])
+
+    # 修正3：初始移動止損
+    trailing   = calc_trailing_stop(best_entry, price, atr, direction, False)
 
     return {
-        "symbol":         symbol,
-        "timeframe":      timeframe,
-        "price":          round(price, 6),
-        "direction":      direction,
-        "long_score":     long_score,
-        "short_score":    short_score,
-        "confidence":     confidence,
-        "entry":          best_entry,
-        "entry_source":   "OB/FVG中點" if best_entry != round(price, 6) else "現價",
-        "stop_loss":      exits["stop_loss"],
-        "atr_stop_loss":  atr_sl,
-        "tp1":            exits["tp1"],
-        "tp2":            exits["tp2"],
-        "tp3":            exits["tp3"],
-        "risk_reward":    exits["risk_reward"],
-        "rsi":            rsi,
-        "macd":           round(macd, 6),
-        "macd_hist":      round(hist, 6),
-        "ema20":          round(ema20, 6),
-        "ema50":          round(ema50, 6),
-        "ema200":         round(ema200, 6),
-        "bb_upper":       round(bb_upper, 6),
-        "bb_lower":       round(bb_lower, 6),
-        "atr":            round(atr, 6),
-        "vwap":           vwap,
-        "adx":            adx_info["adx"],
-        "trend_strength": adx_info["trend_strength"],
-        "divergence":     div["divergence"],
-        "nearest_sup":    sr["nearest_sup"],
-        "nearest_res":    sr["nearest_res"],
-        "dist_to_sup":    sr["dist_to_sup"],
-        "dist_to_res":    sr["dist_to_res"],
-        "funding_rate":   funding["rate"],
-        "funding_signal": funding["signal"],
-        "oi_change":      oi["oi_change"],
-        "oi_signal":      oi["oi_signal"],
-        "swing_high":     round(swing_high, 6),
-        "swing_low":      round(swing_low, 6),
-        "order_blocks":   obs,
-        "fvg":            fvgs,
-        "bos":            bos,
-        "choch":          choch,
-        "candle_pattern": candle["name"],
-        "vol_ratio":      vol_info["vol_ratio"],
-        "upper_trend":    upper_trend or "—",
-        "harmonic":       harmonic,
+        "symbol":           symbol,
+        "timeframe":        timeframe,
+        "price":            round(price, 6),
+        "direction":        direction,
+        "long_score":       long_score,
+        "short_score":      short_score,
+        "confidence":       confidence,
+        "entry":            best_entry,
+        "entry_source":     "OB/FVG中點" if best_entry != round(price,6) else "現價",
+        "stop_loss":        exits["stop_loss"],
+        "atr_stop_loss":    atr_sl,
+        "trailing_sl":      trailing["trailing_sl"],
+        "sl_type":          trailing["sl_type"],
+        "tp1":              exits["tp1"],
+        "tp2":              exits["tp2"],
+        "tp3":              exits["tp3"],
+        "risk_reward":      exits["risk_reward"],
+        "position_pct":     position["position_pct"],
+        "risk_label":       position["risk_label"],
+        "market_structure": market_st["label"],
+        "market_strategy":  market_st["strategy"],
+        "breakout":         breakout["breakout_label"],
+        "rsi":              rsi,
+        "macd":             round(macd, 6),
+        "macd_hist":        round(hist, 6),
+        "ema20":            round(ema20, 6),
+        "ema50":            round(ema50, 6),
+        "ema200":           round(ema200, 6),
+        "bb_upper":         round(bb_upper, 6),
+        "bb_lower":         round(bb_lower, 6),
+        "vwap":             vwap,
+        "atr":              round(atr, 6),
+        "adx":              adx_info["adx"],
+        "trend_strength":   adx_info["trend_strength"],
+        "divergence":       div["divergence"],
+        "nearest_sup":      sr["nearest_sup"],
+        "nearest_res":      sr["nearest_res"],
+        "dist_to_sup":      sr["dist_to_sup"],
+        "dist_to_res":      sr["dist_to_res"],
+        "funding_rate":     funding["rate"],
+        "funding_signal":   funding["signal"],
+        "oi_change":        oi["oi_change"],
+        "oi_signal":        oi["oi_signal"],
+        "swing_high":       round(swing_high, 6),
+        "swing_low":        round(swing_low, 6),
+        "order_blocks":     obs,
+        "fvg":              fvgs,
+        "bos":              bos,
+        "choch":            choch,
+        "candle_pattern":   candle["name"],
+        "vol_ratio":        vol_info["vol_ratio"],
+        "upper_trend":      upper_trend or "—",
+        "harmonic":         harmonic,
     }
 
 
@@ -971,38 +1077,44 @@ def full_analysis(symbol: str) -> Optional[dict]:
 # ──────────────────────────────────────────────
 
 def format_signal(r: dict) -> str:
-    direction_emoji = "🟢 做多 LONG" if r["direction"] == "long" else "🔴 做空 SHORT"
-    harmonic_str    = f"{r['harmonic'][0]} ({r['harmonic'][1]})" if r["harmonic"] else "無"
-    bos_str         = r["bos"]   or "—"
-    choch_str       = r["choch"] or "—"
-    upper_emoji     = "📈" if r["upper_trend"] == "up" else ("📉" if r["upper_trend"] == "down" else "—")
-    sup_str = f"`{r['nearest_sup']}` ({r['dist_to_sup']}%)" if r["nearest_sup"] else "—"
-    res_str = f"`{r['nearest_res']}` ({r['dist_to_res']}%)" if r["nearest_res"] else "—"
+    d_emoji  = "🟢 做多 LONG" if r["direction"] == "long" else "🔴 做空 SHORT"
+    h_str    = f"{r['harmonic'][0]} ({r['harmonic'][1]})" if r["harmonic"] else "無"
+    bos_str  = r["bos"]   or "—"
+    choch_str= r["choch"] or "—"
+    up_emoji = "📈" if r["upper_trend"]=="up" else ("📉" if r["upper_trend"]=="down" else "—")
+    sup_str  = f"`{r['nearest_sup']}` ({r['dist_to_sup']}%)" if r["nearest_sup"] else "—"
+    res_str  = f"`{r['nearest_res']}` ({r['dist_to_res']}%)" if r["nearest_res"] else "—"
 
     rsi = r["rsi"]
-    if rsi < 30:   rsi_label = "超賣🔥"
-    elif rsi > 70: rsi_label = "超買❄️"
-    elif rsi < 45: rsi_label = "偏弱⬇️"
-    elif rsi > 55: rsi_label = "偏強⬆️"
-    else:          rsi_label = "中性⚪️"
+    if rsi < 30:   rl = "超賣🔥"
+    elif rsi > 70: rl = "超買❄️"
+    elif rsi < 45: rl = "偏弱⬇️"
+    elif rsi > 55: rl = "偏強⬆️"
+    else:          rl = "中性⚪️"
 
     return (
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📌 *{r['symbol']}USDT* ｜ {r['timeframe']} ｜ {direction_emoji}\n"
-        f"🎯 信心度：{r['confidence']}\n"
+        f"📌 *{r['symbol']}USDT* ｜ {r['timeframe']} ｜ {d_emoji}\n"
+        f"🎯 信心度：{r['confidence']} ｜ 倉位：{r['position_pct']}% {r['risk_label']}\n"
+        f"🏛 市場結構：{r['market_structure']}\n"
+        f"💡 策略建議：{r['market_strategy']}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 *進場*：`{r['entry']}` ({r['entry_source']})\n"
         f"\n"
         f"📐 *出場價位*\n"
-        f"  🛑 Fib止損  (0.618)：`{r['stop_loss']}`\n"
-        f"  🛑 ATR動態止損     ：`{r['atr_stop_loss']}`\n"
-        f"  🎯 止盈1   (1.272)：`{r['tp1']}`\n"
-        f"  🎯 止盈2   (1.618)：`{r['tp2']}`\n"
-        f"  🎯 止盈3   (2.618)：`{r['tp3']}`\n"
-        f"  ⚖️  風報比 R:R     ：`1 : {r['risk_reward']}`\n"
+        f"  🛑 Fib止損        ：`{r['stop_loss']}`\n"
+        f"  🛑 ATR止損        ：`{r['atr_stop_loss']}`\n"
+        f"  🛑 {r['sl_type']}：`{r['trailing_sl']}`\n"
+        f"  🎯 止盈1 (1.272) ：`{r['tp1']}`\n"
+        f"  🎯 止盈2 (1.618) ：`{r['tp2']}`\n"
+        f"  🎯 止盈3 (2.618) ：`{r['tp3']}`\n"
+        f"  ⚖️  風報比 R:R    ：`1 : {r['risk_reward']}`\n"
+        f"\n"
+        f"🚀 *突破訊號*：{r['breakout']}\n"
+        f"🔀 *背離*    ：{r['divergence']}\n"
         f"\n"
         f"📊 *技術指標*\n"
-        f"  RSI    ：`{r['rsi']}` {rsi_label}\n"
+        f"  RSI    ：`{r['rsi']}` {rl}\n"
         f"  MACD   ：`{r['macd']}` ｜ Hist `{r['macd_hist']}`\n"
         f"  EMA20  ：`{r['ema20']}`\n"
         f"  EMA50  ：`{r['ema50']}`\n"
@@ -1016,10 +1128,9 @@ def format_signal(r: dict) -> str:
         f"  最近支撐：{sup_str}\n"
         f"  最近壓力：{res_str}\n"
         f"\n"
-        f"🔀 *背離*：{r['divergence']}\n"
         f"🕯 *K線型態*：{r['candle_pattern']}\n"
         f"📦 *成交量比*：`{r['vol_ratio']}x`\n"
-        f"🌐 *上層週期*：{upper_emoji} {r['upper_trend']}\n"
+        f"🌐 *上層週期*：{up_emoji} {r['upper_trend']}\n"
         f"\n"
         f"💹 *籌碼分析*\n"
         f"  資金費率：`{r['funding_rate']}%` {r['funding_signal']}\n"
@@ -1031,7 +1142,7 @@ def format_signal(r: dict) -> str:
         f"  OB   ：{len(r['order_blocks'])} 個\n"
         f"  FVG  ：{len(r['fvg'])} 個\n"
         f"\n"
-        f"🔷 *和諧型態*：{harmonic_str}\n"
+        f"🔷 *和諧型態*：{h_str}\n"
         f"\n"
         f"📈 *評分*：多 {r['long_score']} ／ 空 {r['short_score']}\n"
         f"🕯 Swing High：`{r['swing_high']}` / Low：`{r['swing_low']}`\n"
