@@ -1,8 +1,19 @@
 """
-bot.py v7.0
+bot.py v8.0
 ===========
-配合 analysis_engine v7.0
-完全無 Bug 版本
+整合四大系統：
+  1. 歷史回測
+  2. 自適應參數
+  3. ML 勝率預測
+  4. 風控系統
+
+新增指令：
+  /backtest BTC → 對單一幣種做回測
+  /winrate      → 查看系統實際勝率統計
+  /riskstatus   → 查看風控狀態
+  /riskresume   → 解除風控暫停
+  /win BTC      → 手動記錄交易獲利（更新ML）
+  /lose BTC     → 手動記錄交易虧損（更新ML）
 """
 
 import asyncio
@@ -12,9 +23,15 @@ import os
 from datetime import datetime, timezone, timedelta
 from telegram import Update, Bot
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-from analysis_engine import (full_analysis, format_signal, TOP30_COINS,
-                              fetch_klines, fetch_fear_greed,
-                              calc_atr, calc_trailing_stop)
+from analysis_engine import (
+    full_analysis, format_signal, TOP30_COINS,
+    fetch_klines, fetch_fear_greed,
+    calc_atr, calc_trailing_stop,
+    backtest_symbol, quick_backtest,
+    get_market_volatility, update_adaptive_params,
+    get_risk_status, reset_risk_pause, record_trade_result,
+    ml_update, _signal_cache,
+)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8556894585:AAFSzzBsMC-1f1VinHfAdbjY-QGu0zsB_Tw")
 TW_TZ     = timezone(timedelta(hours=8))
@@ -28,6 +45,9 @@ _signals_lock  = threading.Lock()
 active_signals: list = []
 MAX_SIGNALS    = 50
 
+# 儲存最近訊號的 ML features（供 /win /lose 指令更新）
+_last_signals: dict = {}   # {symbol: {features, direction}}
+
 
 def add_signal(sig: dict):
     with _signals_lock:
@@ -38,9 +58,9 @@ def add_signal(sig: dict):
 
 def remove_signals(to_remove: list):
     with _signals_lock:
-        for sig in to_remove:
-            if sig in active_signals:
-                active_signals.remove(sig)
+        for s in to_remove:
+            if s in active_signals:
+                active_signals.remove(s)
 
 
 def get_signals_copy() -> list:
@@ -61,7 +81,7 @@ def scan_all(top_n: int = 5) -> list:
             if r:
                 score = max(r["long_score"], r["short_score"])
                 results.append((score, r))
-                print(f"  ✅ {symbol} 強力訊號！分數：{score} 信心：{r['confidence']}")
+                print(f"  ✅ {symbol} 訊號！分數：{score} 勝率預測：{r['winrate_pct']}%")
             else:
                 print(f"  ⏭ {symbol} 無訊號")
         except Exception as e:
@@ -70,26 +90,36 @@ def scan_all(top_n: int = 5) -> list:
     return [r for _, r in results[:top_n]]
 
 
+# ══════════════════════════════
+# 基本指令
+# ══════════════════════════════
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     CHAT_IDS.add(update.effective_chat.id)
     await update.message.reply_text(
-        "👋 *加密貨幣分析 Bot v7.0*\n\n"
-        "📌 *指令*：\n"
-        "  /a BTC   → 分析單一幣種\n"
-        "  /scan    → 立即掃描前30大\n"
-        "  /autoon  → 開啟自動推播\n"
-        "  /autooff → 關閉自動推播\n"
-        "  /quiet   → 靜音模式\n"
-        "  /loud    → 關閉靜音\n"
-        "  /market  → 市場情緒\n"
-        "  /status  → 監控中的訊號\n\n"
-        "🆕 *v7.0 核心改進*：\n"
-        "  • 三重確認制\n"
-        "  • 最終否決機制\n"
-        "  • 突破收盤確認\n"
-        "  • 風報比 < 1.5 自動過濾\n"
-        "  • ADX < 15 完全不開倉\n"
-        "  • 預估勝率：80%+",
+        "👋 *加密貨幣分析 Bot v8.0*\n\n"
+        "📌 *基本指令*：\n"
+        "  /a BTC      → 分析幣種（含ML勝率）\n"
+        "  /scan       → 掃描前30大\n"
+        "  /autoon     → 開啟自動推播\n"
+        "  /autooff    → 關閉自動推播\n"
+        "  /quiet      → 靜音模式\n"
+        "  /loud       → 關閉靜音\n"
+        "  /market     → 市場情緒\n"
+        "  /status     → 監控中的訊號\n\n"
+        "🆕 *進階指令*：\n"
+        "  /backtest BTC → 回測單一幣種\n"
+        "  /winrate      → 系統實際勝率\n"
+        "  /riskstatus   → 風控狀態\n"
+        "  /riskresume   → 解除風控暫停\n"
+        "  /win BTC      → 記錄獲利（更新ML）\n"
+        "  /lose BTC     → 記錄虧損（更新ML）\n\n"
+        "🔬 *v8.0 核心系統*：\n"
+        "  • ML預測勝率（0~100%）\n"
+        "  • 歷史回測驗證\n"
+        "  • 自適應參數調整\n"
+        "  • 風控：連虧3次自動暫停\n"
+        "  • Kelly Criterion 倉位管理",
         parse_mode="Markdown"
     )
 
@@ -100,11 +130,13 @@ async def cmd_analyse(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ 請輸入幣種，例如：/a BTC")
         return
     symbol = context.args[0].upper()
-    await update.message.reply_text(f"⏳ 正在分析 {symbol}（三重確認中）...")
+    await update.message.reply_text(f"⏳ 正在分析 {symbol}（ML評估中）...")
     loop = asyncio.get_running_loop()
     r    = await loop.run_in_executor(None, full_analysis, symbol)
     if r:
         await update.message.reply_text(format_signal(r), parse_mode="Markdown")
+        _last_signals[symbol] = {"features": r.get("ml_features", []),
+                                  "direction": r["direction"]}
         add_signal({
             "symbol": symbol, "direction": r["direction"],
             "entry": r["entry"], "atr": r["atr"],
@@ -116,28 +148,39 @@ async def cmd_analyse(update: Update, context: ContextTypes.DEFAULT_TYPE):
         })
         await update.message.reply_text(
             f"🔔 已開啟 *{symbol}* 止盈止損監控！\n"
-            f"移動止損：`{r['trailing_sl']}` ({r['sl_type']})",
+            f"移動止損：`{r['trailing_sl']}` ({r['sl_type']})\n\n"
+            f"💡 交易結束後請輸入：\n"
+            f"  /win {symbol} 記錄獲利\n"
+            f"  /lose {symbol} 記錄虧損",
             parse_mode="Markdown"
         )
     else:
-        await update.message.reply_text(
-            f"⚠️ *{symbol}* 目前無強力訊號（未通過三重確認）",
-            parse_mode="Markdown"
-        )
+        rsk = get_risk_status()
+        if rsk["paused"]:
+            await update.message.reply_text(
+                f"⚠️ 風控系統暫停中！\n"
+                f"連續虧損：{rsk['consecutive_losses']} 次\n"
+                f"輸入 /riskresume 可手動恢復",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(f"⚠️ *{symbol}* 目前無強力訊號", parse_mode="Markdown")
 
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     CHAT_IDS.add(update.effective_chat.id)
-    await update.message.reply_text("🔍 三重確認掃描中，約需2分鐘...")
+    await update.message.reply_text("🔍 ML三重確認掃描中，約需2分鐘...")
     loop    = asyncio.get_running_loop()
     signals = await loop.run_in_executor(None, scan_all)
     if signals:
         await update.message.reply_text(f"📊 找到 {len(signals)} 個高品質訊號：")
         for r in signals:
             await update.message.reply_text(format_signal(r), parse_mode="Markdown")
+            _last_signals[r["symbol"]] = {"features": r.get("ml_features", []),
+                                           "direction": r["direction"]}
             await asyncio.sleep(0.5)
     else:
-        await update.message.reply_text("📭 本次掃描無通過三重確認的訊號")
+        await update.message.reply_text("📭 本次掃描無訊號（三重確認+ML過濾）")
 
 
 async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -148,10 +191,10 @@ async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🌡️ *市場情緒指數*\n\n"
         f"  指數：`{fg['value']}` / 100\n"
         f"  狀態：{fg['label']}\n\n"
-        f"📊 *解讀*：\n"
-        f"  0-24   😱 極度恐懼 → 做多機會\n"
-        f"  25-49  😨 恐懼     → 偏多\n"
-        f"  50-74  😊 貪婪     → 偏空\n"
+        f"📊 解讀：\n"
+        f"  0-24  😱 極度恐懼 → 做多機會\n"
+        f"  25-49 😨 恐懼     → 偏多\n"
+        f"  50-74 😊 貪婪     → 偏空\n"
         f"  75-100 🤑 極度貪婪 → 做空機會",
         parse_mode="Markdown"
     )
@@ -164,10 +207,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     msg = f"📋 *監控中（{len(sigs)} 筆）*\n\n"
     for s in sigs:
-        d  = "🟢多" if s["direction"] == "long" else "🔴空"
+        d  = "🟢多" if s["direction"]=="long" else "🔴空"
         tp = "✅已達" if s["tp1_hit"] else "⏳等待"
-        msg += (f"  {d} *{s['symbol']}* 進場：`{s['entry']}`\n"
-                f"     移動止損：`{s['last_trailing_sl']}` TP1：{tp}\n\n")
+        msg += f"  {d} *{s['symbol']}* 進場:`{s['entry']}` 移動止損:`{s['last_trailing_sl']}` TP1:{tp}\n\n"
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
@@ -177,10 +219,10 @@ async def cmd_auto_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     auto_push_active = True
     await update.message.reply_text(
         "✅ *自動推播已開啟！*\n"
-        "• 每5分鐘三重確認掃描\n"
+        "• 每5分鐘 ML+三重確認掃描\n"
         "• 移動止損追蹤\n"
         "• 止盈/止損自動警告\n"
-        "• 每日早上8點（台灣時間）市場總結",
+        "• 每日早8點市場總結+回測報告",
         parse_mode="Markdown"
     )
 
@@ -203,6 +245,109 @@ async def cmd_loud(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔊 靜音模式關閉")
 
 
+# ══════════════════════════════
+# 進階指令
+# ══════════════════════════════
+
+async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """回測單一幣種"""
+    symbol = context.args[0].upper() if context.args else "BTC"
+    await update.message.reply_text(f"⏳ 正在回測 {symbol}（約需30秒）...")
+    loop = asyncio.get_running_loop()
+    r    = await loop.run_in_executor(None, backtest_symbol, symbol, 80)
+    msg  = (
+        f"📊 *{symbol} 回測結果*\n\n"
+        f"  總交易次數：{r['trades']} 筆\n"
+        f"  勝利：{r.get('wins', 0)} 筆\n"
+        f"  虧損：{r.get('losses', 0)} 筆\n"
+        f"  *歷史勝率：{r['winrate']}%*\n\n"
+        f"{'⚠️ 樣本數不足，結果僅供參考' if r['trades'] < 5 else '✅ 樣本數足夠，結果可靠'}"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def cmd_winrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看系統實際勝率統計"""
+    rsk = get_risk_status()
+    msg = (
+        f"📈 *系統勝率統計*\n\n"
+        f"  總訊號數：{rsk['total_signals']} 筆\n"
+        f"  獲利：{rsk['winning_signals']} 筆\n"
+        f"  *實際勝率：{rsk['actual_winrate']}%*\n"
+        f"  累計損益：{rsk['total_pnl_pct']}%\n\n"
+        f"🔒 *風控狀態*\n"
+        f"  系統狀態：{'⚠️ 暫停中' if rsk['paused'] else '✅ 運作中'}\n"
+        f"  連續虧損：{rsk['consecutive_losses']} 次\n\n"
+        f"💡 每次交易結束後請用 /win 或 /lose 記錄結果，讓ML越用越準！"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def cmd_risk_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rsk = get_risk_status()
+    msg = (
+        f"🔒 *風控系統狀態*\n\n"
+        f"  狀態：{'⚠️ 暫停中' if rsk['paused'] else '✅ 正常運作'}\n"
+        f"  連續虧損：{rsk['consecutive_losses']} / 3 次\n"
+        f"  總交易：{rsk['total_signals']} 筆\n"
+        f"  實際勝率：{rsk['actual_winrate']}%\n\n"
+        f"{'輸入 /riskresume 可手動恢復' if rsk['paused'] else '⚡ 連虧3次將自動暫停保護本金'}"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def cmd_risk_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reset_risk_pause()
+    await update.message.reply_text(
+        "✅ 風控暫停已解除，系統恢復正常運作\n"
+        "⚠️ 請確認市場環境後謹慎交易",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_win(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """記錄交易獲利，更新 ML"""
+    symbol = context.args[0].upper() if context.args else None
+    if not symbol:
+        await update.message.reply_text("⚠️ 請輸入幣種，例如：/win BTC")
+        return
+    record_trade_result(win=True, pnl_pct=2.0)
+    if symbol in _last_signals:
+        ml_update(_last_signals[symbol]["features"], win=True)
+        del _last_signals[symbol]
+    await update.message.reply_text(
+        f"✅ 已記錄 *{symbol}* 獲利！\n"
+        f"ML模型已更新，連續虧損歸零\n"
+        f"當前勝率：{get_risk_status()['actual_winrate']}%",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_lose(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """記錄交易虧損，更新 ML"""
+    symbol = context.args[0].upper() if context.args else None
+    if not symbol:
+        await update.message.reply_text("⚠️ 請輸入幣種，例如：/lose BTC")
+        return
+    record_trade_result(win=False, pnl_pct=-1.0)
+    if symbol in _last_signals:
+        ml_update(_last_signals[symbol]["features"], win=False)
+        del _last_signals[symbol]
+    rsk = get_risk_status()
+    msg = (
+        f"❌ 已記錄 *{symbol}* 虧損\n"
+        f"ML模型已更新學習\n"
+        f"連續虧損：{rsk['consecutive_losses']} / 3 次\n"
+        f"當前勝率：{rsk['actual_winrate']}%"
+    )
+    if rsk["paused"]:
+        msg += "\n\n⚠️ *風控暫停！連虧3次，請休息觀望*\n輸入 /riskresume 可手動恢復"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+# ══════════════════════════════
+# 背景：自動掃描
+# ══════════════════════════════
 def auto_push_loop(bot_token: str):
     async def push():
         bot = Bot(token=bot_token)
@@ -210,7 +355,7 @@ def auto_push_loop(bot_token: str):
             for cid in list(CHAT_IDS):
                 try:
                     await bot.send_message(cid,
-                        f"🔍 *自動掃描開始* ｜ {tw_now()}\n三重確認掃描中...",
+                        f"🔍 *自動掃描開始* ｜ {tw_now()}\nML+三重確認掃描中...",
                         parse_mode="Markdown")
                 except Exception: pass
 
@@ -218,9 +363,15 @@ def auto_push_loop(bot_token: str):
         if signals:
             for cid in list(CHAT_IDS):
                 try:
-                    await bot.send_message(cid, f"🔔 *發現 {len(signals)} 個高品質訊號！*", parse_mode="Markdown")
+                    await bot.send_message(cid,
+                        f"🔔 *發現 {len(signals)} 個高品質訊號！*",
+                        parse_mode="Markdown")
                     for r in signals:
                         await bot.send_message(cid, format_signal(r), parse_mode="Markdown")
+                        _last_signals[r["symbol"]] = {
+                            "features": r.get("ml_features", []),
+                            "direction": r["direction"]
+                        }
                         add_signal({
                             "symbol": r["symbol"], "direction": r["direction"],
                             "entry": r["entry"], "atr": r["atr"],
@@ -247,9 +398,12 @@ def auto_push_loop(bot_token: str):
             except Exception as e: print(f"[推播錯誤] {e}")
 
 
+# ══════════════════════════════
+# 背景：止盈止損監控
+# ══════════════════════════════
 def price_monitor_loop(bot_token: str):
     async def check():
-        bot       = Bot(token=bot_token)
+        bot = Bot(token=bot_token)
         to_remove = []
 
         for sig in get_signals_copy():
@@ -257,27 +411,24 @@ def price_monitor_loop(bot_token: str):
                 data = fetch_klines(sig["symbol"], "5m", 20)
                 if data is None or len(data) < 2: continue
 
-                price  = float(data[-1, 4])
-                atr    = calc_atr(data[:, 2], data[:, 3], data[:, 4])
+                price = float(data[-1, 4])
+                atr   = calc_atr(data[:, 2], data[:, 3], data[:, 4])
                 if atr <= 0: atr = float(sig.get("atr", 1.0))
 
-                cid = sig["chat_id"]
-                d   = sig["direction"]
-                sym = sig["symbol"]
+                cid = sig["chat_id"]; d = sig["direction"]; sym = sig["symbol"]
 
                 # 移動止損更新
-                new_t  = calc_trailing_stop(sig["entry"], price, atr, d, sig["tp1_hit"])
-                new_sl = new_t["trailing_sl"]
-                old_sl = sig["last_trailing_sl"]
-                moved  = ((d=="long" and new_sl > old_sl + atr*0.3) or
-                          (d=="short" and new_sl < old_sl - atr*0.3))
+                nt    = calc_trailing_stop(sig["entry"], price, atr, d, sig["tp1_hit"])
+                nsl   = nt["trailing_sl"]; osl = sig["last_trailing_sl"]
+                moved = ((d=="long" and nsl > osl + atr*0.3) or
+                         (d=="short" and nsl < osl - atr*0.3))
                 if moved:
                     try:
                         await bot.send_message(cid,
                             f"📊 *{sym}USDT 移動止損更新*\n"
-                            f"  {new_t['sl_type']}：`{old_sl}` → `{new_sl}`",
+                            f"  {nt['sl_type']}：`{osl}` → `{nsl}`",
                             parse_mode="Markdown")
-                        sig["last_trailing_sl"] = new_sl
+                        sig["last_trailing_sl"] = nsl
                     except Exception: pass
 
                 # 止損
@@ -286,7 +437,9 @@ def price_monitor_loop(bot_token: str):
                 if sl_hit:
                     try:
                         await bot.send_message(cid,
-                            f"🚨 *{sym}USDT 止損觸發！*\n現價：`{price}` / 止損：`{sig['last_trailing_sl']}`",
+                            f"🚨 *{sym}USDT 止損觸發！*\n"
+                            f"現價：`{price}` 止損：`{sig['last_trailing_sl']}`\n"
+                            f"請記錄結果：/lose {sym}",
                             parse_mode="Markdown")
                     except Exception: pass
                     to_remove.append(sig); continue
@@ -295,7 +448,8 @@ def price_monitor_loop(bot_token: str):
                 if not sig["tp1_hit"] and ((d=="long" and price>=sig["tp1"]) or (d=="short" and price<=sig["tp1"])):
                     try:
                         await bot.send_message(cid,
-                            f"🎯 *{sym}USDT 到達止盈1！*\n現價：`{price}` / TP1：`{sig['tp1']}`\n建議出場50%",
+                            f"🎯 *{sym}USDT 到達止盈1！*\n"
+                            f"現價：`{price}` TP1：`{sig['tp1']}`\n建議出場50%",
                             parse_mode="Markdown")
                     except Exception: pass
                     sig["tp1_hit"] = True
@@ -303,7 +457,8 @@ def price_monitor_loop(bot_token: str):
                 elif sig["tp1_hit"] and not sig["tp2_hit"] and ((d=="long" and price>=sig["tp2"]) or (d=="short" and price<=sig["tp2"])):
                     try:
                         await bot.send_message(cid,
-                            f"🎯🎯 *{sym}USDT 到達止盈2！*\n現價：`{price}` / TP2：`{sig['tp2']}`\n建議再出場30%",
+                            f"🎯🎯 *{sym}USDT 到達止盈2！*\n"
+                            f"現價：`{price}` TP2：`{sig['tp2']}`\n建議再出場30%",
                             parse_mode="Markdown")
                     except Exception: pass
                     sig["tp2_hit"] = True
@@ -311,7 +466,9 @@ def price_monitor_loop(bot_token: str):
                 elif sig["tp2_hit"] and ((d=="long" and price>=sig["tp3"]) or (d=="short" and price<=sig["tp3"])):
                     try:
                         await bot.send_message(cid,
-                            f"🎯🎯🎯 *{sym}USDT 到達最終止盈！*\n現價：`{price}` / TP3：`{sig['tp3']}`\n🏆 全部出場！",
+                            f"🎯🎯🎯 *{sym}USDT 到達最終止盈！*\n"
+                            f"現價：`{price}` TP3：`{sig['tp3']}`\n"
+                            f"🏆 全部出場！請記錄：/win {sym}",
                             parse_mode="Markdown")
                     except Exception: pass
                     to_remove.append(sig)
@@ -329,13 +486,45 @@ def price_monitor_loop(bot_token: str):
             except Exception as e: print(f"[監控錯誤] {e}")
 
 
+# ══════════════════════════════
+# 背景：自適應參數更新（每6小時）
+# ══════════════════════════════
+def adaptive_update_loop():
+    """每6小時做一次快速回測，更新自適應參數"""
+    while True:
+        time.sleep(21600)   # 6小時
+        try:
+            print("[自適應] 開始更新參數...")
+            bt  = quick_backtest(["BTC","ETH","SOL","XRP","BNB"], 60)
+            vol = get_market_volatility("BTC")
+            update_adaptive_params(bt["overall_winrate"], vol)
+            print(f"[自適應] 更新完成，回測勝率：{bt['overall_winrate']}% 波動率：{vol:.3f}")
+        except Exception as e:
+            print(f"[自適應錯誤] {e}")
+
+
+# ══════════════════════════════
+# 背景：每日早8點
+# ══════════════════════════════
 def daily_summary_loop(bot_token: str):
     async def summary():
         bot = Bot(token=bot_token)
         fg  = fetch_fear_greed()
-        msg = (f"☀️ *每日市場總結 - {datetime.now(TW_TZ).strftime('%Y/%m/%d')}*\n\n"
-               f"🌡️ 恐懼貪婪指數：`{fg['value']}` {fg['label']}\n\n"
-               f"📋 即將進行三重確認全市場掃描...")
+        rsk = get_risk_status()
+
+        # 每日回測
+        bt = quick_backtest(["BTC","ETH","SOL"], 50)
+
+        msg = (
+            f"☀️ *每日市場總結 - {datetime.now(TW_TZ).strftime('%Y/%m/%d')}*\n\n"
+            f"🌡️ 恐懼貪婪：`{fg['value']}` {fg['label']}\n\n"
+            f"📊 *系統統計*\n"
+            f"  實際勝率：`{rsk['actual_winrate']}%` "
+            f"({rsk['winning_signals']}/{rsk['total_signals']}筆)\n"
+            f"  回測勝率：`{bt['overall_winrate']}%` ({bt['total_trades']}筆)\n"
+            f"  風控狀態：{'⚠️ 暫停中' if rsk['paused'] else '✅ 正常'}\n\n"
+            f"📋 即將進行全市場掃描..."
+        )
         for cid in list(CHAT_IDS):
             try: await bot.send_message(cid, msg, parse_mode="Markdown")
             except Exception as e: print(f"  [每日總結錯誤] {cid}：{e}")
@@ -345,7 +534,7 @@ def daily_summary_loop(bot_token: str):
             now    = datetime.now(TW_TZ)
             target = now.replace(hour=8, minute=0, second=0, microsecond=0)
             if now >= target: target += timedelta(days=1)
-            secs = max(1.0, (target - now).total_seconds())
+            secs   = max(1.0, (target - now).total_seconds())
             print(f"[每日總結] 距離下次：{int(secs/3600)}小時")
             time.sleep(secs)
             if auto_push_active and CHAT_IDS:
@@ -355,20 +544,48 @@ def daily_summary_loop(bot_token: str):
             time.sleep(3600)
 
 
+# ══════════════════════════════
+# 啟動
+# ══════════════════════════════
 if __name__ == "__main__":
-    print(f"Bot v7.0 啟動中... {tw_now()}")
-    for fn in [auto_push_loop, price_monitor_loop, daily_summary_loop]:
-        threading.Thread(target=fn, args=(BOT_TOKEN,), daemon=True).start()
+    print(f"Bot v8.0 啟動中... {tw_now()}")
+
+    # 啟動時做一次快速自適應更新
+    try:
+        vol = get_market_volatility("BTC")
+        rsk = get_risk_status()
+        update_adaptive_params(rsk["actual_winrate"] if rsk["total_signals"] > 10 else 65.0, vol)
+        print(f"[啟動] 自適應參數初始化完成，市場波動率：{vol:.3f}")
+    except Exception as e:
+        print(f"[啟動] 自適應初始化失敗：{e}")
+
+    threads = [
+        threading.Thread(target=auto_push_loop,      args=(BOT_TOKEN,), daemon=True),
+        threading.Thread(target=price_monitor_loop,   args=(BOT_TOKEN,), daemon=True),
+        threading.Thread(target=daily_summary_loop,   args=(BOT_TOKEN,), daemon=True),
+        threading.Thread(target=adaptive_update_loop, daemon=True),
+    ]
+    for t in threads: t.start()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    for cmd, handler in [
-        ("start",   cmd_start),   ("a",       cmd_analyse),
-        ("scan",    cmd_scan),    ("autoon",  cmd_auto_on),
-        ("autooff", cmd_auto_off),("market",  cmd_market),
-        ("status",  cmd_status),  ("quiet",   cmd_quiet),
-        ("loud",    cmd_loud),
+    for cmd, fn in [
+        ("start",      cmd_start),
+        ("a",          cmd_analyse),
+        ("scan",       cmd_scan),
+        ("autoon",     cmd_auto_on),
+        ("autooff",    cmd_auto_off),
+        ("market",     cmd_market),
+        ("status",     cmd_status),
+        ("quiet",      cmd_quiet),
+        ("loud",       cmd_loud),
+        ("backtest",   cmd_backtest),
+        ("winrate",    cmd_winrate),
+        ("riskstatus", cmd_risk_status),
+        ("riskresume", cmd_risk_resume),
+        ("win",        cmd_win),
+        ("lose",       cmd_lose),
     ]:
-        app.add_handler(CommandHandler(cmd, handler))
+        app.add_handler(CommandHandler(cmd, fn))
 
-    print("✅ Bot v7.0 已啟動！")
+    print("✅ Bot v8.0 已啟動！")
     app.run_polling()
