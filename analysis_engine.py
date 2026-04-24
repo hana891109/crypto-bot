@@ -31,6 +31,45 @@ TOP30_COINS = [
     "FIL","HBAR","ARB","OP","INJ","SUI","VET","GRT","AAVE","MKR",
 ]
 
+# 多週期設定（5m ~ 1d 全覆蓋）
+ALL_TIMEFRAMES = ["5m","15m","1h","4h","1d"]
+
+# 每個週期對應的交易類型
+TF_TYPE = {
+    "5m":  "超短線⚡",
+    "15m": "短線🔵",
+    "1h":  "短中線🟡",
+    "4h":  "中線🟠",
+    "1d":  "長線🔴",
+}
+
+# 每個週期的止損倍數（ATR）
+TF_SL_MULTIPLIER = {
+    "5m":  0.8,
+    "15m": 1.0,
+    "1h":  1.5,
+    "4h":  2.0,
+    "1d":  3.0,
+}
+
+# 每個週期的建議倉位上限（%）
+TF_MAX_POSITION = {
+    "5m":  5.0,
+    "15m": 8.0,
+    "1h":  12.0,
+    "4h":  18.0,
+    "1d":  25.0,
+}
+
+# 每個週期最少需要的 K 線數量
+TF_MIN_BARS = {
+    "5m":  60,
+    "15m": 60,
+    "1h":  80,
+    "4h":  100,
+    "1d":  60,
+}
+
 COIN_TIMEFRAME = {
     "BTC":"4h","ETH":"4h","BNB":"4h","XRP":"4h","SOL":"4h",
     "ADA":"4h","DOGE":"4h","TRX":"4h","AVAX":"4h","SHIB":"1h",
@@ -40,7 +79,7 @@ COIN_TIMEFRAME = {
     "SUI":"1h","VET":"1h","GRT":"1h","AAVE":"4h","MKR":"4h",
 }
 
-UPPER_TIMEFRAME = {"15m":"1h","1h":"4h","4h":"1d","1d":"1w"}
+UPPER_TIMEFRAME = {"5m":"15m","15m":"1h","1h":"4h","4h":"1d","1d":"1w"}
 FIB_RETRACEMENT = [0.236,0.382,0.5,0.618,0.786]
 FIB_EXTENSION   = [1.0,1.272,1.414,1.618,2.0,2.618]
 EPS             = 1e-10
@@ -1015,33 +1054,297 @@ def format_signal(r:dict) -> str:
         return f"❌ 格式化錯誤：{e}"
 
 # ──────────────────────────────────────────────
+# 多週期分析系統
+# ──────────────────────────────────────────────
+
+def full_analysis_tf(symbol: str, timeframe: str) -> Optional[dict]:
+    """
+    指定週期分析單一幣種
+    每個週期有獨立的止損倍數、倉位上限、最少K線數
+    """
+    try:
+        if _risk_control["paused"]: return None
+
+        min_bars = TF_MIN_BARS.get(timeframe, 60)
+        data = fetch_klines(symbol, timeframe, 200)
+        if data is None or len(data) < min_bars: return None
+
+        o=data[:,1]; h=data[:,2]; l=data[:,3]; c=data[:,4]; v=data[:,5]
+        price = float(c[-1])
+
+        # 基礎指標
+        rsi = calc_rsi(c); macd, ms, hist = calc_macd(c)
+        bbu, _, bbl = calc_bollinger(c)
+        e20 = float(calc_ema(c,20)[-1])
+        e50 = float(calc_ema(c,50)[-1])
+        e200 = float(calc_ema(c,min(200,max(2,len(c)-1)))[-1])
+        atr = calc_atr(h,l,c); vwap = calc_vwap(h,l,c,v)
+        adx = calc_adx(h,l,c)
+        ms_info = detect_market_structure(h,l,c,atr)
+        bo = detect_breakout(h,l,c,v,atr)
+        sr = detect_support_resistance(h,l,c)
+
+        # 短線週期減少耗時的 API 呼叫
+        if timeframe in ("5m","15m"):
+            div = {"rsi_bull_div":False,"rsi_bear_div":False,"macd_bull_div":False,"divergence":"無"}
+            funding = {"rate":0.0,"signal":"—"}
+            oi = {"oi":0.0,"oi_change":0.0,"oi_signal":"—"}
+        else:
+            div = detect_divergence(h,l,c,lookback=20)
+            funding = fetch_funding_rate(symbol)
+            oi = fetch_open_interest(symbol)
+
+        sh, sl = find_swing_points(h,l,50)
+        obs = detect_order_blocks(o,h,l,c)
+        fvgs = detect_fvg(h,l,c)
+        bos, choch = detect_bos_choch(h,l,c)
+        harmonic = scan_harmonics(h,l,80)
+        vi = calc_volume_confirmation(v,c)
+        candle = detect_candle_pattern(o,h,l,c)
+        ut = get_upper_trend(symbol, timeframe)
+
+        # 評分
+        ls = ss = 0
+        if rsi<30: ls+=2
+        elif rsi<45: ls+=1
+        elif rsi>70: ss+=2
+        elif rsi>55: ss+=1
+        if hist>0 and macd>ms: ls+=2
+        elif hist<0 and macd<ms: ss+=2
+        if price>e20>e50>e200: ls+=3
+        elif price<e20<e50<e200: ss+=3
+        elif price>e50: ls+=1
+        elif price<e50: ss+=1
+        if price<bbl: ls+=1
+        elif price>bbu: ss+=1
+        if price>vwap: ls+=1
+        elif price<vwap: ss+=1
+        sc=adx["adx_score"]
+        if sc>0:
+            if adx["pdi"]>adx["mdi"]: ls+=sc
+            else: ss+=sc
+        else: ls=max(0,ls+sc); ss=max(0,ss+sc)
+        if adx["pdi"]>adx["mdi"]: ls+=1
+        else: ss+=1
+        if ms_info["structure"]=="trending_up": ls+=2
+        elif ms_info["structure"]=="trending_down": ss+=2
+        if bo["breakout"]=="bullish": ls+=4
+        elif bo["breakout"]=="bearish": ss+=4
+        if any(x.get("type")=="bullish_ob" for x in obs): ls+=1
+        if any(x.get("type")=="bearish_ob" for x in obs): ss+=1
+        if any(x.get("type")=="bullish_fvg" for x in fvgs): ls+=1
+        if any(x.get("type")=="bearish_fvg" for x in fvgs): ss+=1
+        if bos=="bullish_bos": ls+=2
+        elif bos=="bearish_bos": ss+=2
+        if choch=="bullish_choch": ls+=3
+        elif choch=="bearish_choch": ss+=3
+        if harmonic:
+            if harmonic[1]=="long": ls+=2
+            else: ss+=2
+        if vi["bullish_vol"]: ls+=2
+        if vi["bearish_vol"]: ss+=2
+        if candle["hammer"] or candle["engulfing_bull"] or candle["doji_bull"]: ls+=2
+        if candle["shooting_star"] or candle["engulfing_bear"]: ss+=2
+        ua=False
+        if ut=="up": ls+=2; ua=True
+        elif ut=="down": ss+=2; ua=True
+        hd=False
+        if div["rsi_bull_div"] or div["macd_bull_div"]: ls+=3; hd=True
+        if div["rsi_bear_div"]: ss+=3; hd=True
+        if funding["rate"]>0.15: ss+=1
+        if funding["rate"]<-0.15: ls+=1
+
+        diff=abs(ls-ss); mx=max(ls,ss)
+        if ls==ss: return None
+        if diff<_adaptive_params["min_score_diff"]: return None
+        if mx<_adaptive_params["min_score_total"]: return None
+
+        direction="long" if ls>ss else "short"
+
+        # 否決
+        veto=check_veto(direction,rsi,macd,ms,hist,adx["adx"],funding["rate"],ms_info["structure"],ut)
+        if veto["vetoed"]: return None
+
+        # BTC崩跌（短線更敏感）
+        btc_info=check_btc_crash(symbol)
+        crash_pct = -3.0 if timeframe in ("5m","15m") else BTC_CRASH_PCT
+        if btc_info["btc_change"] <= crash_pct and direction=="long": return None
+
+        # 情緒過濾
+        sentiment=check_sentiment_filter(direction)
+        if sentiment["blocked"]: return None
+
+        # 多時間框架投票（短線只需主週期確認）
+        if timeframe not in ("5m","15m"):
+            mtf=multi_timeframe_vote(symbol,timeframe,direction)
+            if not mtf["passed"]: return None
+            mtf_label=mtf["label"]
+        else:
+            mtf_label="短線（跳過多週期）"
+
+        # 鯨魚成交量
+        whale=detect_whale_volume(v,c)
+        if whale["whale_bull"]: ls+=3
+        if whale["whale_bear"]: ss+=3
+
+        # 週期專屬止損
+        sl_multiplier = TF_SL_MULTIPLIER.get(timeframe, 2.0)
+        best_entry=get_best_entry(price,obs,fvgs,direction,atr)
+        exits=get_fib_exits(sh,sl,best_entry,direction)
+
+        # 用週期專屬止損覆蓋 ATR 止損
+        if direction=="long":
+            atr_sl=round(best_entry-atr*sl_multiplier,8)
+        else:
+            atr_sl=round(best_entry+atr*sl_multiplier,8)
+
+        if exits["risk_reward"]<_adaptive_params["min_rr"]: return None
+        if is_duplicate_signal(f"{symbol}_{timeframe}", direction, price, atr): return None
+
+        trailing=calc_trailing_stop(best_entry,price,atr,direction,False)
+
+        hv_=bool(vi["bullish_vol"] or vi["bearish_vol"])
+        hc_=bool(any([candle["hammer"],candle["engulfing_bull"],candle["doji_bull"],
+                      candle["shooting_star"],candle["engulfing_bear"]]))
+        hbo=bool(bo["breakout"] is not None)
+        itr=bool(ms_info["structure"] in ("trending_up","trending_down"))
+        features=build_ml_features(diff,adx["adx"],exits["risk_reward"],
+                                   hv_,hc_,ua,hbo,itr,rsi,direction,hist,macd,ms,hd)
+        winrate_pct=ml_predict_winrate(features)
+
+        # 短線勝率門檻稍低
+        min_wr = 60.0 if timeframe in ("5m","15m") else MIN_WINRATE_PCT
+        if winrate_pct < min_wr: return None
+
+        # 週期專屬倉位上限
+        max_pos = TF_MAX_POSITION.get(timeframe, 15.0)
+        position=calc_position_size(winrate_pct,exits["risk_reward"],ms_info["structure"],adx["adx"])
+        position["position_pct"] = min(position["position_pct"], max_pos)
+
+        tf_type = TF_TYPE.get(timeframe, "未知")
+
+        return {
+            "symbol":str(symbol),"timeframe":str(timeframe),
+            "tf_type":tf_type,"price":round(float(price),8),
+            "direction":str(direction),"long_score":int(ls),"short_score":int(ss),
+            "winrate_pct":float(winrate_pct),
+            "entry":round(float(best_entry),8),
+            "entry_source":"OB/FVG中點" if best_entry!=round(price,8) else "現價",
+            "stop_loss":float(exits["stop_loss"]),
+            "atr_stop_loss":float(atr_sl),
+            "trailing_sl":float(trailing["trailing_sl"]),"sl_type":str(trailing["sl_type"]),
+            "tp1":float(exits["tp1"]),"tp2":float(exits["tp2"]),"tp3":float(exits["tp3"]),
+            "risk_reward":float(exits["risk_reward"]),
+            "position_pct":float(position["position_pct"]),"risk_label":str(position["risk_label"]),
+            "market_structure":str(ms_info["label"]),"market_strategy":str(ms_info["strategy"]),
+            "breakout":str(bo["breakout_label"]),
+            "rsi":float(rsi),"macd":round(float(macd),8),"macd_hist":round(float(hist),8),
+            "ema20":round(float(e20),8),"ema50":round(float(e50),8),"ema200":round(float(e200),8),
+            "bb_upper":round(float(bbu),8),"bb_lower":round(float(bbl),8),
+            "vwap":round(float(vwap),8),"atr":round(float(atr),8),
+            "adx":float(adx["adx"]),"trend_strength":str(adx["trend_strength"]),
+            "pdi":float(adx["pdi"]),"mdi":float(adx["mdi"]),
+            "divergence":str(div["divergence"]),
+            "nearest_sup":sr["nearest_sup"],"nearest_res":sr["nearest_res"],
+            "dist_to_sup":sr["dist_to_sup"],"dist_to_res":sr["dist_to_res"],
+            "funding_rate":float(funding["rate"]),"funding_signal":str(funding["signal"]),
+            "oi_change":float(oi["oi_change"]),"oi_signal":str(oi["oi_signal"]),
+            "swing_high":round(float(sh),8),"swing_low":round(float(sl),8),
+            "order_blocks":obs,"fvg":fvgs,"bos":bos,"choch":choch,
+            "candle_pattern":str(candle["name"]),"vol_ratio":float(vi["vol_ratio"]),
+            "upper_trend":str(ut) if ut else "—","harmonic":harmonic,
+            "ml_features":features,"veto_reasons":veto["reasons"],
+            "mtf_label":mtf_label,
+            "btc_label":btc_info["label"],
+            "sentiment_label":sentiment["label"],
+            "whale_label":whale["label"],
+        }
+    except Exception as e:
+        print(f"  ❌ full_analysis_tf({symbol},{timeframe}) 錯誤：{e}")
+        return None
+
+
+def multi_tf_scan_symbol(symbol: str) -> list:
+    """
+    對單一幣種掃描所有週期（5m~1d）
+    回傳該幣種所有有效訊號
+    同一幣種不同週期可以同時出訊號
+    """
+    results = []
+    for tf in ALL_TIMEFRAMES:
+        try:
+            r = full_analysis_tf(symbol, tf)
+            if r:
+                score = max(r["long_score"], r["short_score"])
+                results.append((score, r))
+                print(f"  ✅ {symbol} {tf} 訊號！勝率：{r['winrate_pct']}%")
+        except Exception as e:
+            print(f"  ❌ {symbol} {tf} 失敗：{e}")
+    return results
+
+
+# ──────────────────────────────────────────────
 # 並行掃描
 # ──────────────────────────────────────────────
-def scan_single(symbol:str):
-    try:
-        r=full_analysis(symbol)
-        if r: return (max(r["long_score"],r["short_score"]),r)
-    except Exception as e: print(f"  ❌ {symbol} 失敗：{e}")
-    return None
+def scan_single_multitf(symbol: str) -> list:
+    """掃描單一幣種的所有週期，並行模式下只掃主要週期"""
+    if _parallel_mode:
+        # 並行模式：只掃 1h/4h/1d 節省時間
+        tfs = ["1h","4h","1d"]
+    else:
+        tfs = ALL_TIMEFRAMES
+    results = []
+    for tf in tfs:
+        try:
+            r = full_analysis_tf(symbol, tf)
+            if r:
+                score = max(r["long_score"], r["short_score"])
+                results.append((score, r))
+        except Exception as e:
+            print(f"  ❌ {symbol} {tf} 失敗：{e}")
+    return results
 
-def parallel_scan(top_n:int=5, max_workers:int=8) -> list:
+
+def parallel_scan(top_n: int = 5, max_workers: int = 8) -> list:
+    """
+    並行掃描所有幣種的多個週期
+    每個幣種掃描 1h/4h/1d 三個週期
+    同一幣種不同週期可以同時出訊號
+    """
     global _parallel_mode
-    _parallel_mode=True
-    results=[]; print(f"[掃描] 並行掃描 {len(TOP30_COINS)} 個幣種...")
+    _parallel_mode = True
+    all_results = []
+    print(f"[掃描] 多週期並行掃描 {len(TOP30_COINS)} 個幣種（1h/4h/1d）...")
+
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures={ex.submit(scan_single,sym):sym for sym in TOP30_COINS}
+        futures = {ex.submit(scan_single_multitf, sym): sym for sym in TOP30_COINS}
         for future in as_completed(futures):
-            sym=futures[future]
+            sym = futures[future]
             try:
-                res=future.result(timeout=60)
-                if res:
-                    score,r=res; results.append((score,r))
-                    print(f"  ✅ {sym} 訊號！勝率：{r['winrate_pct']}%")
-                else: print(f"  ⏭ {sym} 無訊號")
-            except Exception as e: print(f"  ❌ {sym}：{e}")
-    _parallel_mode=False
-    results.sort(key=lambda x:x[0],reverse=True)
-    return [r for _,r in results[:top_n]]
+                results = future.result(timeout=90)
+                if results:
+                    for score, r in results:
+                        all_results.append((score, r))
+                        print(f"  ✅ {sym} {r['timeframe']} 訊號！勝率：{r['winrate_pct']}%")
+                else:
+                    print(f"  ⏭ {sym} 無訊號")
+            except Exception as e:
+                print(f"  ❌ {sym}：{e}")
+
+    _parallel_mode = False
+    # 依分數排序，取前 top_n 個（不同幣種+週期的組合）
+    all_results.sort(key=lambda x: x[0], reverse=True)
+    return [r for _, r in all_results[:top_n]]
+
+
+def full_tf_scan(symbol: str, top_n: int = 3) -> list:
+    """
+    完整掃描單一幣種的所有週期（5m~1d）
+    供 /a BTC 指令使用，顯示所有週期訊號
+    """
+    results = multi_tf_scan_symbol(symbol)
+    results.sort(key=lambda x: x[0], reverse=True)
+    return [r for _, r in results[:top_n]]
 
 # 初始化
 load_risk_control()

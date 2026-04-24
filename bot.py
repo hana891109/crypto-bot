@@ -16,6 +16,7 @@ from analysis_engine import (
     get_market_volatility, update_adaptive_params,
     get_risk_status, reset_risk_pause, record_trade_result,
     ml_update, parallel_scan,
+    full_tf_scan, ALL_TIMEFRAMES, TF_TYPE,
 )
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN","8556894585:AAFSzzBsMC-1f1VinHfAdbjY-QGu0zsB_Tw")
@@ -57,9 +58,10 @@ def scan_all(top_n:int=5) -> list:
 async def cmd_start(update:Update, context:ContextTypes.DEFAULT_TYPE):
     CHAT_IDS.add(update.effective_chat.id)
     await update.message.reply_text(
-        "👋 *加密貨幣分析 Bot v9.0*\n\n"
+        "👋 *加密貨幣分析 Bot v9.1*\n\n"
         "📌 *基本指令*：\n"
-        "  /a BTC      → 分析幣種（含ML勝率）\n"
+        "  /a BTC         → 分析所有週期（5m~1d）\n"
+        "  /a BTC 4h      → 分析指定週期\n"
         "  /scan       → 掃描前30大幣種\n"
         "  /autoon     → 開啟自動推播\n"
         "  /autooff    → 關閉自動推播\n"
@@ -74,7 +76,11 @@ async def cmd_start(update:Update, context:ContextTypes.DEFAULT_TYPE):
         "  /riskresume   → 解除風控暫停\n"
         "  /win BTC      → 記錄獲利（訓練ML）\n"
         "  /lose BTC     → 記錄虧損（訓練ML）\n\n"
-        "🆕 *v9.0 核心功能*：\n"
+        "🆕 *v9.1 多週期功能*：\n"
+        "  • 5m/15m/1h/4h/1d 全週期掃描\n"
+        "  • 週期專屬止損止盈計算\n"
+        "  • 短線/長線分開倉位建議\n"
+        "  • 週期衝突自動過濾\n"
         "  • OKX API（全球可用）\n"
         "  • ML勝率預測（0~100%）\n"
         "  • 勝率<70%自動過濾\n"
@@ -93,21 +99,34 @@ async def cmd_analyse(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("⚠️ 請輸入幣種，例如：/a BTC"); return
     symbol=context.args[0].upper()
-    await update.message.reply_text(f"⏳ 正在分析 {symbol}（ML評估中）...")
-    loop=asyncio.get_running_loop()
-    r=await loop.run_in_executor(None,full_analysis,symbol)
-    if r:
-        await update.message.reply_text(format_signal(r),parse_mode="Markdown")
-        _last_signals[symbol]={"features":r.get("ml_features",[]),"direction":r["direction"]}
-        add_signal({
-            "symbol":symbol,"direction":r["direction"],"entry":r["entry"],"atr":r["atr"],
-            "sl":r["stop_loss"],"tp1":r["tp1"],"tp2":r["tp2"],"tp3":r["tp3"],
-            "tp1_hit":False,"tp2_hit":False,"last_trailing_sl":r["trailing_sl"],
-            "chat_id":update.effective_chat.id,
-        })
+
+    # 支援指定週期：/a BTC 4h 或 /a BTC（掃描所有週期）
+    if len(context.args) >= 2 and context.args[1] in ALL_TIMEFRAMES:
+        target_tf = context.args[1]
+        await update.message.reply_text(f"⏳ 正在分析 {symbol} {target_tf}（ML評估中）...")
+        loop = asyncio.get_running_loop()
+        from analysis_engine import full_analysis_tf
+        r = await loop.run_in_executor(None, full_analysis_tf, symbol, target_tf)
+        signals = [r] if r else []
+    else:
+        await update.message.reply_text(f"⏳ 正在分析 {symbol} 所有週期（5m~1d）...")
+        loop = asyncio.get_running_loop()
+        signals = await loop.run_in_executor(None, full_tf_scan, symbol, 5)
+
+    if signals:
+        await update.message.reply_text(f"📊 *{symbol}* 找到 {len(signals)} 個週期訊號：")
+        for r in signals:
+            await update.message.reply_text(format_signal(r), parse_mode="Markdown")
+            _last_signals[symbol]={"features":r.get("ml_features",[]),"direction":r["direction"]}
+            add_signal({
+                "symbol":symbol,"direction":r["direction"],"entry":r["entry"],"atr":r["atr"],
+                "sl":r["stop_loss"],"tp1":r["tp1"],"tp2":r["tp2"],"tp3":r["tp3"],
+                "tp1_hit":False,"tp2_hit":False,"last_trailing_sl":r["trailing_sl"],
+                "chat_id":update.effective_chat.id,
+            })
+            await asyncio.sleep(0.5)
         await update.message.reply_text(
-            f"🔔 已開啟 *{symbol}* 止盈止損監控！\n"
-            f"移動止損：`{r['trailing_sl']}` ({r['sl_type']})\n\n"
+            f"🔔 已開啟 *{symbol}* 所有週期止盈止損監控！\n\n"
             f"💡 交易結束後請輸入：\n"
             f"  /win {symbol} → 記錄獲利\n"
             f"  /lose {symbol} → 記錄虧損",
@@ -118,7 +137,11 @@ async def cmd_analyse(update:Update, context:ContextTypes.DEFAULT_TYPE):
         if rsk["paused"]:
             await update.message.reply_text(f"⚠️ 風控暫停中！連續虧損{rsk['consecutive_losses']}次\n輸入 /riskresume 解除",parse_mode="Markdown")
         else:
-            await update.message.reply_text(f"⚠️ *{symbol}* 目前無強力訊號（未通過所有過濾）",parse_mode="Markdown")
+            await update.message.reply_text(
+                f"⚠️ *{symbol}* 所有週期目前無強力訊號\n"
+                f"（5m/15m/1h/4h/1d 均未通過過濾）",
+                parse_mode="Markdown"
+            )
 
 async def cmd_scan(update:Update, context:ContextTypes.DEFAULT_TYPE):
     CHAT_IDS.add(update.effective_chat.id)
