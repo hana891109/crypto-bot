@@ -48,17 +48,19 @@ FIB_RETRACEMENT = [0.236, 0.382, 0.5, 0.618, 0.786]
 FIB_EXTENSION   = [1.0, 1.272, 1.414, 1.618, 2.0, 2.618]
 EPS             = 1e-10
 
-# Binance 正確備用域名（Binance 官方提供）
-BINANCE_KLINE_URLS = [
-    "https://api.binance.com/api/v3/klines",
-    "https://data.binance.com/api/v3/klines",
-]
-FUTURES_BASE_URLS = [
-    "https://fapi.binance.com/fapi/v1",
-]
-# 保留舊變數名相容性
-BINANCE_URL = BINANCE_KLINE_URLS[0]
-FUTURES_URL = FUTURES_BASE_URLS[0]
+# OKX API（全球可用，無地理限制）
+OKX_BASE      = "https://www.okx.com"
+OKX_KLINE_URL = f"{OKX_BASE}/api/v5/market/candles"
+OKX_TICKER    = f"{OKX_BASE}/api/v5/market/ticker"
+OKX_FUNDING   = f"{OKX_BASE}/api/v5/public/funding-rate"
+OKX_OI        = f"{OKX_BASE}/api/v5/public/open-interest"
+
+# OKX 週期對照表
+OKX_INTERVAL = {
+    "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m",
+    "30m": "30m", "1h": "1H", "2h": "2H", "4h": "4H",
+    "6h": "6H", "12h": "12H", "1d": "1D", "1w": "1W",
+}
 
 # 動態門檻（會被自適應系統調整）
 _adaptive_params = {
@@ -301,7 +303,7 @@ def update_adaptive_params(recent_winrate: float, market_volatility: float):
 
 
 def get_market_volatility(symbol: str = "BTC") -> float:
-    """計算市場波動率（BTC 的 ATR/Price）"""
+    """計算市場波動率（BTC 的 ATR/Price），使用 OKX"""
     try:
         data = fetch_klines(symbol, "1d", 14)
         if data is None or len(data) < 10:
@@ -314,6 +316,21 @@ def get_market_volatility(symbol: str = "BTC") -> float:
         return float(atr / max(price, EPS))
     except Exception:
         return 0.03
+
+
+def fetch_okx_ticker(symbol: str) -> Optional[float]:
+    """OKX 現貨即時價格（用於快速驗證連線）"""
+    try:
+        r = requests.get(OKX_TICKER,
+                         params={"instId": f"{symbol}-USDT"},
+                         timeout=5)
+        if r.ok:
+            data = r.json()
+            if data.get("code") == "0" and data.get("data"):
+                return float(data["data"][0]["last"])
+    except Exception:
+        pass
+    return None
 
 
 # ──────────────────────────────────────────────
@@ -460,54 +477,64 @@ def quick_backtest(symbols: list = None, periods: int = 80) -> dict:
 def fetch_klines(symbol: str, interval: str = "4h",
                  limit: int = 200, retries: int = 1) -> Optional[np.ndarray]:
     """
-    自動嘗試備用域名，解決 Binance 451 地理限制
-    retries=1：每個域名只試一次，確保掃描速度在 2~3 分鐘內
+    使用 OKX API 抓取 K 線資料
+    OKX 全球可用，無地理限制
+
+    OKX K線格式：
+    [timestamp, open, high, low, close, vol, volCcy, volCcyQuote, confirm]
+    index:  0      1     2    3    4     5    6       7             8
     """
-    pair   = f"{symbol}USDT"
-    params = {"symbol": pair, "interval": interval, "limit": limit}
+    okx_interval = OKX_INTERVAL.get(interval, "4H")
+    inst_id      = f"{symbol}-USDT-SWAP"   # 永續合約（有資金費率）
+    spot_inst    = f"{symbol}-USDT"        # 現貨
 
-    for url in BINANCE_KLINE_URLS:
+    for inst in [spot_inst, inst_id]:
         try:
-            resp = requests.get(url, params=params, timeout=8)
+            params = {
+                "instId": inst,
+                "bar":    okx_interval,
+                "limit":  str(min(limit, 300)),
+            }
+            resp = requests.get(OKX_KLINE_URL, params=params, timeout=8)
 
-            # 451 = 地理限制，直接換下一個域名，不重試
-            if resp.status_code == 451:
-                print(f"  🌐 {url} 地理限制(451)，換備用域名...")
-                continue
-
-            # 其他錯誤也換域名
             if not resp.ok:
-                print(f"  ⚠️ {symbol} {url} 狀態碼：{resp.status_code}")
                 continue
 
             raw = resp.json()
-            if not raw or isinstance(raw, dict):
-                return None
+            if raw.get("code") != "0" or not raw.get("data"):
+                continue
+
+            bars = raw["data"]
+            if not bars:
+                continue
+
+            # OKX 回傳最新在前，需反轉
+            bars = bars[::-1]
 
             data = np.array(
-                [[float(k[0]), float(k[1]), float(k[2]),
-                  float(k[3]), float(k[4]), float(k[5])]
-                 for k in raw],
+                [[float(b[0]), float(b[1]), float(b[2]),
+                  float(b[3]), float(b[4]), float(b[5])]
+                 for b in bars],
                 dtype=np.float64
             )
 
             if data.ndim != 2 or data.shape[1] < 6:
-                return None
+                continue
             if np.isnan(data).any() or np.isinf(data).any():
-                return None
-            if data[:, 5].sum() < EPS:
-                return None
+                continue
+            if len(data) < 10:
+                continue
 
             return data   # ✅ 成功
 
         except requests.exceptions.Timeout:
-            print(f"  ⚠️ {symbol} {url} 逾時，換域名")
+            print(f"  ⚠️ {symbol} OKX 逾時")
             continue
         except Exception as e:
-            print(f"  ⚠️ {symbol} {url} 失敗：{e}")
+            print(f"  ⚠️ {symbol} OKX 失敗：{e}")
             continue
 
-    print(f"  ❌ {symbol} {interval} 所有域名均失敗")
+    print(f"  ❌ {symbol} {interval} OKX 取得失敗")
     return None
 
 
@@ -1059,46 +1086,40 @@ def fetch_fear_greed() -> dict:
 
 
 def fetch_funding_rate(symbol: str) -> dict:
-    for base in FUTURES_BASE_URLS:
-        try:
-            r = requests.get(f"{base}/premiumIndex",
-                             params={"symbol": f"{symbol}USDT"}, timeout=8)
-            if r.status_code == 451:
-                continue
-            r.raise_for_status()
-            rate = round(float(r.json()["lastFundingRate"]) * 100, 4)
-            sig  = "多方擁擠⚠️" if rate > 0.1 else ("空方擁擠⚠️" if rate < -0.1 else "市場平衡✅")
-            return {"rate": rate, "signal": sig}
-        except Exception:
-            continue
+    """OKX 資金費率"""
+    try:
+        r = requests.get(
+            OKX_FUNDING,
+            params={"instId": f"{symbol}-USDT-SWAP"},
+            timeout=8
+        )
+        if r.ok:
+            data = r.json()
+            if data.get("code") == "0" and data.get("data"):
+                rate = round(float(data["data"][0]["fundingRate"]) * 100, 4)
+                sig  = "多方擁擠⚠️" if rate > 0.1 else ("空方擁擠⚠️" if rate < -0.1 else "市場平衡✅")
+                return {"rate": rate, "signal": sig}
+    except Exception:
+        pass
     return {"rate": 0.0, "signal": "無法取得"}
 
 
 def fetch_open_interest(symbol: str) -> dict:
-    for base in FUTURES_BASE_URLS:
-        try:
-            r1 = requests.get(f"{base}/openInterest",
-                              params={"symbol": f"{symbol}USDT"}, timeout=8)
-            if r1.status_code == 451:
-                continue
-            r1.raise_for_status()
-            ci = float(r1.json()["openInterest"])
-
-            r2 = requests.get(f"{base}/openInterestHist",
-                              params={"symbol": f"{symbol}USDT", "period": "1h", "limit": 2},
-                              timeout=8)
-            if r2.status_code == 451:
-                continue
-            r2.raise_for_status()
-            hist = r2.json()
-            oc   = 0.0
-            if isinstance(hist, list) and len(hist) >= 2:
-                prev = float(hist[0]["sumOpenInterest"])
-                oc   = round((ci - prev) / max(prev, EPS) * 100, 2)
-            sig = "OI急增📈" if oc > 2 else ("OI急減📉" if oc < -2 else "OI穩定➡️")
-            return {"oi": round(ci, 2), "oi_change": oc, "oi_signal": sig}
-        except Exception:
-            continue
+    """OKX 未平倉量"""
+    try:
+        r = requests.get(
+            OKX_OI,
+            params={"instId": f"{symbol}-USDT-SWAP", "instType": "SWAP"},
+            timeout=8
+        )
+        if r.ok:
+            data = r.json()
+            if data.get("code") == "0" and data.get("data"):
+                oi = float(data["data"][0]["oi"])
+                sig = "OI穩定➡️"
+                return {"oi": round(oi, 2), "oi_change": 0.0, "oi_signal": sig}
+    except Exception:
+        pass
     return {"oi": 0.0, "oi_change": 0.0, "oi_signal": "無法取得"}
 
 
