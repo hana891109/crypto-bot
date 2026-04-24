@@ -46,8 +46,8 @@ FIB_EXTENSION   = [1.0,1.272,1.414,1.618,2.0,2.618]
 EPS             = 1e-10
 
 # 門檻
-MIN_WINRATE_PCT = 70.0
-BTC_CRASH_PCT   = -3.0
+MIN_WINRATE_PCT = 65.0   # 調整：65%以上才推薦（原本70%）
+BTC_CRASH_PCT   = -5.0   # 放寬：BTC跌超過5%才暫停（原本3%）
 FG_ONLY_SHORT   = 80
 FG_ONLY_LONG    = 25
 
@@ -66,8 +66,11 @@ OKX_INTERVAL = {
 
 # 動態門檻
 _adaptive_params = {
-    "min_score_diff":4,"min_score_total":7,
-    "min_adx":15,"min_rr":1.5,"vol_threshold":1.5,
+    "min_score_diff":3,    # 降低：3分差距即可（原本4）
+    "min_score_total":6,   # 降低：總分6即可（原本7）
+    "min_adx":12,          # 降低：趨勢初期也能偵測（原本15）
+    "min_rr":1.5,          # 不變：風報比至少1.5
+    "vol_threshold":1.3,   # 降低：成交量門檻（原本1.5）
 }
 
 # 並行模式旗標
@@ -395,13 +398,15 @@ def multi_timeframe_vote(symbol:str, main_tf:str, direction:str) -> dict:
             c=data[:,4]
             e20=float(calc_ema(c,20)[-1]); e50=float(calc_ema(c,50)[-1])
             rv=calc_rsi(c); _,_,hv=calc_macd(c)
-            bull=e20>e50 and rv>45 and hv>0
-            bear=e20<e50 and rv<55 and hv<0
+            bull=e20>e50 and rv>42 and hv>0   # 放寬RSI條件
+            bear=e20<e50 and rv<58 and hv<0   # 放寬RSI條件
             ok=(direction=="long" and bull) or (direction=="short" and bear)
             if ok: votes+=1
             total+=1; tf_r[tf]="✅" if ok else "❌"
         except: continue
-    passed=bool(votes>=2 and total>0)
+    # 並行模式只需1個通過，完整模式需2個
+    needed=1 if _parallel_mode else 2
+    passed=bool(votes>=needed and total>0)
     return {"passed":passed,"votes":votes,"total":total,
             "label":f"{'✅' if passed else '❌'} {votes}/{total}週期同向"}
 
@@ -454,7 +459,7 @@ def detect_whale_volume(volumes:np.ndarray, closes:np.ndarray) -> dict:
 # ──────────────────────────────────────────────
 def check_veto(direction,rsi,macd,macd_sig,hist,adx,funding_rate,market_structure,upper_trend) -> dict:
     v=[]
-    if adx<_adaptive_params["min_adx"]: v.append(f"ADX={adx:.1f}趨勢太弱")
+    if adx<10: v.append(f"ADX={adx:.1f}趨勢極弱")  # 只在極端橫盤才否決
     if direction=="long"  and rsi>80: v.append(f"RSI={rsi}嚴重超買")
     if direction=="short" and rsi<20: v.append(f"RSI={rsi}嚴重超賣")
     if direction=="long"  and macd<macd_sig and hist<0 and macd<0: v.append("MACD空頭排列")
