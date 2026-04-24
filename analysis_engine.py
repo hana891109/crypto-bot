@@ -48,6 +48,17 @@ FIB_RETRACEMENT = [0.236, 0.382, 0.5, 0.618, 0.786]
 FIB_EXTENSION   = [1.0, 1.272, 1.414, 1.618, 2.0, 2.618]
 EPS             = 1e-10
 
+# ── 新增系統常數 ──
+MIN_WINRATE_PCT  = 70.0   # 勝率低於此值不推薦
+SIGNAL_EXPIRE_H  = 2      # 訊號有效期（小時）
+BTC_CRASH_PCT    = -3.0   # BTC 跌幅超過此值暫停山寨幣
+FG_ONLY_SHORT    = 80     # 恐懼貪婪 > 此值只做空
+FG_ONLY_LONG     = 25     # 恐懼貪婪 < 此值只做多
+# 訊號時間戳記（用於有效期過濾）
+import threading as _threading2
+_signal_timestamps: dict = {}
+_ts_lock = _threading2.Lock()
+
 # OKX API（全球可用，無地理限制）
 OKX_BASE      = "https://www.okx.com"
 OKX_KLINE_URL = f"{OKX_BASE}/api/v5/market/candles"
@@ -267,6 +278,142 @@ def build_ml_features(score_diff: int, adx: float, rr: float,
 
 
 # ──────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# 新系統1：多時間框架投票制
+# ──────────────────────────────────────────────
+
+def multi_timeframe_vote(symbol: str, main_tf: str, direction: str) -> dict:
+    """
+    同時分析多個時間框架，需要 3 個以上同方向才通過
+    parallel_mode 下只用 2 個週期節省時間
+    """
+    if _parallel_mode:
+        tfs = [main_tf, UPPER_TIMEFRAME.get(main_tf, main_tf)]
+    else:
+        tfs = ["1h", "4h", "1d"]
+
+    votes = 0; total = 0; tf_results = {}
+    for tf in tfs:
+        try:
+            data = fetch_klines(symbol, tf, 60)
+            if data is None or len(data) < 30: continue
+            c = data[:, 4]
+            ema20v = float(calc_ema(c, 20)[-1])
+            ema50v = float(calc_ema(c, 50)[-1])
+            rsiv   = calc_rsi(c)
+            _, _, histv = calc_macd(c)
+            bull = (ema20v > ema50v and rsiv > 45 and histv > 0)
+            bear = (ema20v < ema50v and rsiv < 55 and histv < 0)
+            if direction == "long"  and bull: votes += 1
+            if direction == "short" and bear: votes += 1
+            total += 1
+            agree = (direction=="long" and bull) or (direction=="short" and bear)
+            tf_results[tf] = "✅" if agree else "❌"
+        except Exception:
+            continue
+
+    needed = 2 if _parallel_mode else 2
+    passed = bool(votes >= needed and total > 0)
+    return {
+        "passed":     passed,
+        "votes":      votes,
+        "total":      total,
+        "vote_rate":  round(votes / max(total, 1) * 100),
+        "tf_results": tf_results,
+        "label":      f"{'✅' if passed else '❌'} {votes}/{total} 週期同向",
+    }
+
+
+# ──────────────────────────────────────────────
+# 新系統2：BTC 相關性過濾
+# ──────────────────────────────────────────────
+
+def check_btc_crash(symbol: str) -> dict:
+    """BTC 近期跌幅超過閾值時暫停山寨幣訊號"""
+    if symbol in ("BTC", "ETH"):
+        return {"crashed": False, "btc_change": 0.0, "label": "不適用"}
+    try:
+        data = fetch_klines("BTC", "1h", 5)
+        if data is None or len(data) < 4:
+            return {"crashed": False, "btc_change": 0.0, "label": "無法取得"}
+        prev  = float(data[-4, 4])
+        last  = float(data[-1, 4])
+        chg   = round((last - prev) / max(prev, EPS) * 100, 2)
+        crash = bool(chg <= BTC_CRASH_PCT)
+        return {
+            "crashed":    crash,
+            "btc_change": chg,
+            "label":      f"{'🚨 BTC崩跌' if crash else '✅ BTC正常'} ({chg:+.1f}%)",
+        }
+    except Exception:
+        return {"crashed": False, "btc_change": 0.0, "label": "無法取得"}
+
+
+# ──────────────────────────────────────────────
+# 新系統3：市場情緒過濾
+# ──────────────────────────────────────────────
+
+_fg_cache = {"value": -1, "ts": 0.0}
+_FG_TTL   = 3600
+
+def get_fear_greed_cached() -> int:
+    now = time.time()
+    if now - _fg_cache["ts"] < _FG_TTL and _fg_cache["value"] >= 0:
+        return _fg_cache["value"]
+    fg = fetch_fear_greed()
+    if fg["value"] >= 0:
+        _fg_cache["value"] = fg["value"]
+        _fg_cache["ts"]    = now
+    return _fg_cache["value"]
+
+
+def check_sentiment_filter(direction: str) -> dict:
+    """
+    極度貪婪(>80) → 只做空
+    極度恐懼(<25) → 只做多
+    """
+    fg_val  = get_fear_greed_cached()
+    if fg_val < 0:
+        return {"blocked": False, "fg_value": -1, "label": "無法取得", "reason": ""}
+    blocked = False; reason = ""
+    if fg_val >= FG_ONLY_SHORT and direction == "long":
+        blocked = True; reason = f"極度貪婪({fg_val})，只做空"
+    elif fg_val <= FG_ONLY_LONG and direction == "short":
+        blocked = True; reason = f"極度恐懼({fg_val})，只做多"
+    if fg_val >= 75:   lbl = f"🤑 極度貪婪({fg_val})"
+    elif fg_val >= 55: lbl = f"😊 貪婪({fg_val})"
+    elif fg_val >= 45: lbl = f"😐 中性({fg_val})"
+    elif fg_val >= 25: lbl = f"😨 恐懼({fg_val})"
+    else:              lbl = f"😱 極度恐懼({fg_val})"
+    return {"blocked": blocked, "fg_value": fg_val, "label": lbl, "reason": reason}
+
+
+# ──────────────────────────────────────────────
+# 新系統4：鯨魚成交量偵測
+# ──────────────────────────────────────────────
+
+def detect_whale_volume(volumes: np.ndarray, closes: np.ndarray) -> dict:
+    """成交量 > 均量3倍 = 鯨魚/機構進場"""
+    if len(volumes) < 22:
+        return {"whale": False, "whale_bull": False, "whale_bear": False,
+                "vol_ratio": 1.0, "label": "—"}
+    avg_vol   = float(volumes[-21:-1].mean())
+    last_vol  = float(volumes[-1])
+    vol_ratio = round(last_vol / max(avg_vol, EPS), 2)
+    whale     = bool(vol_ratio >= 3.0)
+    price_up  = bool(float(closes[-1]) > float(closes[-2]))
+    if whale and price_up:    lbl = f"🐋 鯨魚買入（{vol_ratio}x）"
+    elif whale and not price_up: lbl = f"🐋 鯨魚賣出（{vol_ratio}x）"
+    else:                     lbl = f"正常（{vol_ratio}x）"
+    return {
+        "whale":      whale,
+        "whale_bull": bool(whale and price_up),
+        "whale_bear": bool(whale and not price_up),
+        "vol_ratio":  vol_ratio,
+        "label":      lbl,
+    }
+
+
 # 系統2：自適應參數
 # ──────────────────────────────────────────────
 
@@ -1223,7 +1370,7 @@ def full_analysis(symbol: str) -> Optional[dict]:
         if oi["oi_change"]>2 and price>float(c[-2]): long_s+=1
         elif oi["oi_change"]>2 and price<float(c[-2]): short_s+=1
 
-        # 過濾
+        # ── 基本過濾 ──
         diff=abs(long_s-short_s); mx=max(long_s,short_s)
         if long_s==short_s: return None
         if diff<_adaptive_params["min_score_diff"]: return None
@@ -1231,11 +1378,36 @@ def full_analysis(symbol: str) -> Optional[dict]:
 
         direction="long" if long_s>short_s else "short"
 
-        # 否決
+        # ── 原始否決 ──
         veto=check_veto(direction,rsi,macd,ms,hist,adx["adx"],funding["rate"],ms_info["structure"],ut)
         if veto["vetoed"]:
             print(f"  ⛔ {symbol} 被否決：{veto['reasons']}")
             return None
+
+        # ── 新系統2：BTC 崩跌過濾 ──
+        btc_info = check_btc_crash(symbol)
+        if btc_info["crashed"] and direction == "long":
+            print(f"  ⛔ {symbol} BTC崩跌中，暫停多單")
+            return None
+
+        # ── 新系統3：市場情緒過濾 ──
+        sentiment = check_sentiment_filter(direction)
+        if sentiment["blocked"]:
+            print(f"  ⛔ {symbol} 情緒過濾：{sentiment['reason']}")
+            return None
+
+        # ── 新系統1：多時間框架投票 ──
+        mtf = multi_timeframe_vote(symbol, tf, direction)
+        if not mtf["passed"]:
+            print(f"  ⛔ {symbol} 多時間框架投票未通過 {mtf['votes']}/{mtf['total']}")
+            return None
+
+        # ── 新系統4：鯨魚成交量 ──
+        whale = detect_whale_volume(v, c)
+
+        # 鯨魚加分
+        if whale["whale_bull"]: long_s  += 3
+        if whale["whale_bear"]: short_s += 3
 
         best_entry=get_best_entry(price,obs,fvgs,direction,atr)
         exits=get_fib_exits(sh,sl,best_entry,direction)
@@ -1245,18 +1417,23 @@ def full_analysis(symbol: str) -> Optional[dict]:
         atr_sl=(round(best_entry-atr*2.0,8) if direction=="long" else round(best_entry+atr*2.0,8))
         trailing=calc_trailing_stop(best_entry,price,atr,direction,False)
 
-        # 系統3：ML 預測勝率（0~100%）
+        # ── ML 預測勝率（0~100%）──
         hv  = bool(vi["bullish_vol"] or vi["bearish_vol"])
         hc  = bool(any([candle["hammer"],candle["engulfing_bull"],candle["doji_bull"],
                         candle["shooting_star"],candle["engulfing_bear"]]))
         hbo = bool(bo["breakout"] is not None)
         itr = bool(ms_info["structure"] in ("trending_up","trending_down"))
 
-        features   = build_ml_features(diff,adx["adx"],exits["risk_reward"],
-                                       hv,hc,ua,hbo,itr,rsi,direction,hist,macd,ms,hd)
+        features    = build_ml_features(diff,adx["adx"],exits["risk_reward"],
+                                        hv,hc,ua,hbo,itr,rsi,direction,hist,macd,ms,hd)
         winrate_pct = ml_predict_winrate(features)
 
-        # 系統2：倉位（Kelly Criterion）
+        # ── 勝率低於 70% 不推薦 ──
+        if winrate_pct < MIN_WINRATE_PCT:
+            print(f"  ⛔ {symbol} ML勝率 {winrate_pct}% < {MIN_WINRATE_PCT}%，不推薦")
+            return None
+
+        # ── 倉位（Kelly Criterion）──
         position = calc_position_size(winrate_pct, exits["risk_reward"],
                                       ms_info["structure"], adx["adx"])
 
@@ -1316,8 +1493,15 @@ def full_analysis(symbol: str) -> Optional[dict]:
             "vol_ratio":        float(vi["vol_ratio"]),
             "upper_trend":      str(ut) if ut else "—",
             "harmonic":         harmonic,
-            "ml_features":      features,   # 儲存供後續更新ML使用
+            "ml_features":      features,
             "veto_reasons":     veto["reasons"],
+            # 新系統欄位
+            "mtf_label":        mtf["label"],
+            "mtf_votes":        f"{mtf['votes']}/{mtf['total']}",
+            "btc_change":       btc_info["btc_change"],
+            "btc_label":        btc_info["label"],
+            "sentiment_label":  sentiment["label"],
+            "whale_label":      whale["label"],
         }
 
     except Exception as e:
@@ -1385,6 +1569,10 @@ def format_signal(r: dict) -> str:
             f"\n"
             f"📍 支撐：{ss} ｜ 壓力：{rs}\n"
             f"🕯 K線：{r['candle_pattern']} ｜ 量比：`{r['vol_ratio']}x`\n"
+            f"🐋 鯨魚偵測：{r.get('whale_label','—')}\n"
+            f"🗳 多週期投票：{r.get('mtf_label','—')}\n"
+            f"😱 市場情緒：{r.get('sentiment_label','—')}\n"
+            f"₿  BTC狀態：{r.get('btc_label','—')}\n"
             f"🌐 上層週期：{ue} {r['upper_trend']}\n"
             f"\n"
             f"💹 *籌碼*\n"
