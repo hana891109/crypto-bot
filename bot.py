@@ -8,6 +8,13 @@ import asyncio, threading, time, os
 from datetime import datetime, timezone, timedelta
 from telegram import Update, Bot
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from paper_trading import (
+    open_paper_trade, close_paper_trade,
+    get_paper_stats, format_paper_stats,
+    format_open_trades, reset_paper_trading,
+    monitor_paper_trades,
+)
+
 from analysis_engine import (
     full_analysis, format_signal, TOP30_COINS,
     fetch_klines, fetch_fear_greed, get_fear_greed_cached,
@@ -22,9 +29,10 @@ from analysis_engine import (
 BOT_TOKEN = os.environ.get("BOT_TOKEN","8556894585:AAFSzzBsMC-1f1VinHfAdbjY-QGu0zsB_Tw")
 TW_TZ     = timezone(timedelta(hours=8))
 
-CHAT_IDS:         set  = set()
-auto_push_active: bool = False
-quiet_mode:       bool = False
+CHAT_IDS:           set  = set()
+auto_push_active:   bool = False
+quiet_mode:         bool = False
+paper_trading_active: bool = False   # 模擬交易開關
 SCAN_INTERVAL          = 300
 
 _signals_lock = threading.Lock()
@@ -194,7 +202,15 @@ async def cmd_auto_on(update:Update, context:ContextTypes.DEFAULT_TYPE):
         "• 止盈/止損自動警告\n"
         "• 移動止損追蹤\n"
         "• 每日早上8點（台灣時間）市場總結\n\n"
-        "💡 輸入 /quiet 可關閉無訊號通知",
+        "💡 輸入 /quiet 可關閉無訊號通知\n\n"
+        "🤖 *模擬交易指令*：\n"
+        "  /paperon    → 開啟自動模擬交易\n"
+        "  /paperoff   → 關閉模擬交易\n"
+        "  /paperstats → 模擬交易統計\n"
+        "  /paperpos   → 目前模擬持倉\n"
+        "  /paperreset → 重置模擬數據\n"
+        "  /papertf    → 週期績效報告\n"
+        "  /paperlearn → 每日學習總結",
         parse_mode="Markdown"
     )
 
@@ -283,6 +299,63 @@ async def cmd_lose(update:Update, context:ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg,parse_mode="Markdown")
 
 # ══════════════════════════════════════════════
+# 模擬交易指令
+# ══════════════════════════════════════════════
+
+async def cmd_paper_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看模擬交易統計"""
+    CHAT_IDS.add(update.effective_chat.id)
+    await update.message.reply_text(format_paper_stats(), parse_mode="Markdown")
+
+async def cmd_paper_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看目前模擬持倉"""
+    CHAT_IDS.add(update.effective_chat.id)
+    await update.message.reply_text(format_open_trades(), parse_mode="Markdown")
+
+async def cmd_paper_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """重置模擬交易數據"""
+    reset_paper_trading()
+    await update.message.reply_text(
+        "🔄 *模擬交易已重置！*\n"
+        "初始資金：$10,000 USDT\n"
+        "所有持倉和歷史記錄已清空",
+        parse_mode="Markdown"
+    )
+
+async def cmd_paper_tf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """週期績效報告"""
+    from paper_trading import format_tf_report
+    await update.message.reply_text(format_tf_report(), parse_mode="Markdown")
+
+async def cmd_paper_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """每日學習總結"""
+    from paper_trading import get_daily_summary
+    await update.message.reply_text(get_daily_summary(), parse_mode="Markdown")
+
+async def cmd_paper_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """開啟自動模擬交易"""
+    global paper_trading_active
+    paper_trading_active = True
+    await update.message.reply_text(
+        "✅ *自動模擬交易已開啟！*\n\n"
+        "系統會自動：\n"
+        "• 掃描到訊號立即模擬開倉\n"
+        "• 勝率10%~100%全部開倉\n"
+        "• 系統自動判斷槓桿(10~100x)\n"
+        "• 到達TP/SL自動平倉\n"
+        "• 超過48小時自動平倉\n\n"
+        "使用 /paperstats 查看統計",
+        parse_mode="Markdown"
+    )
+
+async def cmd_paper_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """關閉自動模擬交易"""
+    global paper_trading_active
+    paper_trading_active = False
+    await update.message.reply_text("🔕 自動模擬交易已關閉")
+
+
+# ══════════════════════════════════════════════
 # 背景：自動掃描
 # ══════════════════════════════════════════════
 def auto_push_loop(bot_token:str):
@@ -294,6 +367,16 @@ def auto_push_loop(bot_token:str):
                 except: pass
         signals=scan_all()
         if signals:
+            # 模擬交易自動開倉（所有訊號都開，不管勝率）
+            if paper_trading_active:
+                for r in signals:
+                    try:
+                        trade = open_paper_trade(r)
+                        if trade:
+                            print(f"[模擬交易] 自動開倉：{r['symbol']} {r['timeframe']} x{trade['leverage']}")
+                    except Exception as e:
+                        print(f"[模擬交易] 開倉失敗：{e}")
+
             for cid in list(CHAT_IDS):
                 try:
                     await bot.send_message(cid,f"🔔 *發現 {len(signals)} 個高品質訊號！*",parse_mode="Markdown")
@@ -385,6 +468,16 @@ def daily_summary_loop(bot_token:str):
     async def summary():
         bot=Bot(token=bot_token); fg=fetch_fear_greed(); rsk=get_risk_status()
         bt=quick_backtest(["BTC","ETH","SOL"],50)
+        # 模擬交易每日總結
+        try:
+            from paper_trading import get_daily_summary
+            paper_msg = get_daily_summary()
+            for cid in list(CHAT_IDS):
+                try: await bot.send_message(cid, paper_msg, parse_mode="Markdown")
+                except: pass
+        except Exception as e:
+            print(f"[每日模擬總結] {e}")
+
         msg=(f"☀️ *每日市場總結 - {datetime.now(TW_TZ).strftime('%Y/%m/%d')}*\n\n"
              f"🌡️ 恐懼貪婪：`{fg['value']}` {fg['label']}\n\n"
              f"📊 *系統統計*\n"
@@ -441,10 +534,11 @@ if __name__ == "__main__":
     except Exception as e: print(f"[啟動] 初始化失敗：{e}")
 
     threads=[
-        threading.Thread(target=auto_push_loop,    args=(BOT_TOKEN,),daemon=True),
-        threading.Thread(target=price_monitor_loop, args=(BOT_TOKEN,),daemon=True),
-        threading.Thread(target=daily_summary_loop, args=(BOT_TOKEN,),daemon=True),
-        threading.Thread(target=adaptive_update_loop,daemon=True),
+        threading.Thread(target=auto_push_loop,      args=(BOT_TOKEN,),daemon=True),
+        threading.Thread(target=price_monitor_loop,   args=(BOT_TOKEN,),daemon=True),
+        threading.Thread(target=daily_summary_loop,   args=(BOT_TOKEN,),daemon=True),
+        threading.Thread(target=adaptive_update_loop, daemon=True),
+        threading.Thread(target=monitor_paper_trades, daemon=True),  # 模擬交易監控
     ]
     for t in threads: t.start()
 
@@ -461,6 +555,14 @@ if __name__ == "__main__":
         ("backtest",cmd_backtest),("winrate",cmd_winrate),
         ("riskstatus",cmd_risk_status),("riskresume",cmd_risk_resume),
         ("win",cmd_win),("lose",cmd_lose),
+        # 模擬交易指令
+        ("paperon",    cmd_paper_on),
+        ("paperoff",   cmd_paper_off),
+        ("paperstats", cmd_paper_stats),
+        ("paperpos",   cmd_paper_positions),
+        ("paperreset", cmd_paper_reset),
+        ("papertf",    cmd_paper_tf),
+        ("paperlearn", cmd_paper_summary),
     ]:
         app.add_handler(CommandHandler(cmd,fn))
 
