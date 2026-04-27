@@ -1,5 +1,5 @@
 """
-bot.py v10.0
+bot.py v11.0
 ============
 完整優化版本
 """
@@ -68,7 +68,7 @@ def scan_all(top_n:int=5) -> list:
 async def cmd_start(update:Update, context:ContextTypes.DEFAULT_TYPE):
     CHAT_IDS.add(update.effective_chat.id)
     await update.message.reply_text(
-        "👋 *加密貨幣分析 Bot v10.0*\n\n"
+        "👋 *加密貨幣分析 Bot v11.0*\n\n"
         "📌 *基本指令*：\n"
         "  /a BTC       → 分析所有週期（5m~1d）\n"
         "  /a BTC 4h    → 分析指定週期\n"
@@ -489,7 +489,7 @@ def keep_alive_server():
             self.send_response(200); self.end_headers()
             rsk=get_risk_status()
             ps=get_paper_stats()
-            msg=(f"Bot v10.0 | 勝率:{rsk['actual_winrate']}% | "
+            msg=(f"Bot v11.0 | 勝率:{rsk['actual_winrate']}% | "
                  f"模擬勝率:{ps['winrate']}% | {tw_now()}")
             self.wfile.write(msg.encode())
         def log_message(self,format,*args): pass
@@ -550,15 +550,9 @@ def force_single_instance():
 
 
 if __name__ == "__main__":
-    print(f"Bot v10.0 啟動中... {tw_now()}")
+    print(f"Bot v11.0 啟動中... {tw_now()}")
 
-    # 步驟1：強制單一實例（解決 Conflict）
-    force_single_instance()
-    # 額外等待 3 秒確保舊實例完全釋放 token
-    time.sleep(3)
-    print("[啟動] 繼續啟動...")
-
-    # 步驟2：自適應參數初始化
+    # 步驟1：初始化參數
     try:
         vol=get_market_volatility("BTC")
         rsk=get_risk_status()
@@ -566,7 +560,7 @@ if __name__ == "__main__":
         print(f"[啟動] 自適應參數初始化完成，波動率：{vol:.3f}")
     except Exception as e: print(f"[啟動] 初始化失敗：{e}")
 
-    # 步驟3：啟動背景執行緒
+    # 步驟2：啟動背景執行緒
     threads=[
         threading.Thread(target=auto_push_loop,      args=(BOT_TOKEN,),daemon=True),
         threading.Thread(target=price_monitor_loop,   args=(BOT_TOKEN,),daemon=True),
@@ -577,13 +571,9 @@ if __name__ == "__main__":
     ]
     for t in threads: t.start()
 
-    # 步驟4：啟動 Bot（加入 conflict 自動重試）
+    # 步驟3：建立 App
     app = (ApplicationBuilder()
            .token(BOT_TOKEN)
-           .get_updates_read_timeout(30)
-           .get_updates_write_timeout(30)
-           .get_updates_connect_timeout(30)
-           .get_updates_pool_timeout(30)
            .build())
 
     for cmd,fn in [
@@ -601,6 +591,16 @@ if __name__ == "__main__":
     ]:
         app.add_handler(CommandHandler(cmd,fn))
 
-    print("✅ Bot v10.0 已啟動！")
-    # drop_pending_updates=True：忽略舊的待處理訊息
-    app.run_polling(drop_pending_updates=True)
+    print("✅ Bot v11.0 已啟動！")
+    # allowed_updates=[] 讓 Telegram 自動清除舊連線
+    # drop_pending_updates=True 忽略舊訊息
+    # read_timeout=30 避免網路不穩斷線
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=["message","callback_query"],
+        read_timeout=30,
+        write_timeout=30,
+        connect_timeout=30,
+        pool_timeout=30,
+        close_loop=False,
+    )

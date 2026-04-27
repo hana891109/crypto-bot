@@ -830,11 +830,13 @@ def _analyze_core(symbol:str, timeframe:str) -> Optional[dict]:
         # ── 主要評分系統 ──
         ls=ss=0
 
-        # 1. EMA排列（趨勢核心，權重5）
-        if price>e20>e50>e200: ls+=5
-        elif price<e20<e50<e200: ss+=5
-        elif price>e20 and e20>e50: ls+=2
-        elif price<e20 and e20<e50: ss+=2
+        # 1. EMA排列（趨勢核心，權重6）
+        if price>e20>e50>e200: ls+=6   # 完美多頭排列
+        elif price<e20<e50<e200: ss+=6  # 完美空頭排列
+        elif price>e20 and e20>e50: ls+=3
+        elif price<e20 and e20<e50: ss+=3
+        elif price>e50: ls+=1
+        elif price<e50: ss+=1
 
         # 2. Supertrend（趨勢追蹤，權重4）
         if st["direction"]==1: ls+=4
@@ -843,6 +845,10 @@ def _analyze_core(symbol:str, timeframe:str) -> Optional[dict]:
         # 3. 市場結構 HH/HL（PA核心，權重3）
         if ms_info["structure"]=="trending_up": ls+=3
         elif ms_info["structure"]=="trending_down": ss+=3
+
+        # 3b. Supertrend + 市場結構同向額外加分（趨勢一致性）
+        if st["direction"]==1 and ms_info["structure"]=="trending_up": ls+=2
+        elif st["direction"]==-1 and ms_info["structure"]=="trending_down": ss+=2
 
         # 4. VWAP（機構成本，權重2）
         if price>vwap: ls+=2
@@ -988,8 +994,11 @@ def _analyze_core(symbol:str, timeframe:str) -> Optional[dict]:
             min_wr=55.0 if timeframe in ("5m","15m") else MIN_WINRATE_PCT
             if winrate_pct<min_wr: return None
 
-        # 訊號品質等級
-        if winrate_pct>=GRADE_A: grade="🏆 A級"
+        # 訊號品質等級（依ML樣本數調整顯示）
+        samples_now = _ml.get("samples",0)
+        if samples_now < 30:
+            grade = "📊 學習中"   # 樣本不足，數據僅供參考
+        elif winrate_pct>=GRADE_A: grade="🏆 A級"
         elif winrate_pct>=GRADE_B: grade="⭐ B級"
         elif winrate_pct>=GRADE_C: grade="✅ C級"
         else: grade="📊 累積中"
@@ -1064,7 +1073,13 @@ def format_signal(r:dict) -> str:
         elif rsi>55: rl="偏強⬆️"
         else: rl="中性⚪️"
         wr=r["winrate_pct"]
-        we="🟢" if wr>=75 else ("🟡" if wr>=60 else "🔵")
+        samples_disp = _ml.get("samples",0)
+        if samples_disp < 30:
+            we="🔵"  # 學習中
+            wr_label = f"{wr}%（學習中，{samples_disp}筆）"
+        elif wr>=75: we="🟢"; wr_label=f"{wr}%"
+        elif wr>=60: we="🟡"; wr_label=f"{wr}%"
+        else: we="🔴"; wr_label=f"{wr}%"
         rsk=get_risk_status()
         sykes_line=""
         if r.get("sykes_score",0)>0:
@@ -1073,7 +1088,7 @@ def format_signal(r:dict) -> str:
         return (
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📌 *{r['symbol']}USDT* ｜ {r['timeframe']} {r.get('tf_type','')} ｜ {de}\n"
-            f"🏆 訊號等級：{r.get('grade','—')} ｜ 勝率：{we} *{wr}%*\n"
+            f"🏆 訊號等級：{r.get('grade','—')} ｜ 勝率：{we} *{wr_label}*\n"
             f"💼 倉位：{r['position_pct']}% {r['risk_label']}\n"
             f"🏛 結構：{r['market_structure']} ｜ 策略：{r['market_strategy']}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
