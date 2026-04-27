@@ -501,45 +501,62 @@ def keep_alive_server():
 # 啟動
 # ══════════════════════════════════════════════
 
-def clear_old_sessions():
+def force_single_instance():
     """
-    清除舊的 Bot session，解決 Conflict 衝突
-    Render 重新部署時舊實例可能還在，需要先清除
+    強制單一實例運行
+    策略：持續嘗試取得 getUpdates 直到成功（代表舊實例已停止）
+    最多等待 60 秒，確保新實例一定能啟動
     """
     import requests as req
-    max_retries = 10
-    for attempt in range(max_retries):
+
+    print("[啟動] 強制清除舊實例...")
+
+    # 步驟1：刪除 webhook
+    for _ in range(3):
         try:
-            # 先刪除 webhook（確保不用 webhook 模式）
             req.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
                 json={"drop_pending_updates": True},
                 timeout=10
             )
-            # 嘗試取得 updates 並清空
+            break
+        except Exception:
+            time.sleep(2)
+
+    # 步驟2：持續嘗試直到舊實例停止（最多等60秒）
+    for attempt in range(20):
+        try:
             resp = req.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
                 json={"offset": -1, "timeout": 1},
-                timeout=10
+                timeout=8
             )
-            if resp.ok:
-                print(f"[啟動] 舊 session 清除成功（第{attempt+1}次）")
+            data = resp.json()
+            # 成功取得 updates 代表沒有衝突
+            if data.get("ok"):
+                print(f"[啟動] 舊實例已清除（嘗試{attempt+1}次）")
                 return True
+            # 409 Conflict = 舊實例還在，繼續等
+            if resp.status_code == 409 or "Conflict" in str(data):
+                print(f"[啟動] 舊實例還在，等待3秒... ({attempt+1}/20)")
+                time.sleep(3)
+                continue
         except Exception as e:
-            print(f"[啟動] 清除 session 第{attempt+1}次失敗：{e}")
-        time.sleep(3)
+            print(f"[啟動] 嘗試{attempt+1}失敗：{e}")
+            time.sleep(3)
+
+    print("[啟動] 警告：等待逾時，強制啟動")
     return False
 
 
 if __name__ == "__main__":
     print(f"Bot v10.0 啟動中... {tw_now()}")
 
-    # 步驟1：清除舊 session（解決 Conflict）
-    print("[啟動] 清除舊 session 中...")
-    clear_old_sessions()
-    # 等待舊實例完全停止（Render 部署緩衝時間）
-    time.sleep(5)
-    print("[啟動] 舊 session 清除完成，繼續啟動...")
+    # 步驟1：強制單一實例（解決 Conflict）
+    force_single_instance()
+    # 額外等待 3 秒確保舊實例完全釋放 token
+    time.sleep(3)
+    print("[啟動] 繼續啟動...")
 
     # 步驟2：自適應參數初始化
     try:
