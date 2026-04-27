@@ -500,8 +500,48 @@ def keep_alive_server():
 # ══════════════════════════════════════════════
 # 啟動
 # ══════════════════════════════════════════════
+
+def clear_old_sessions():
+    """
+    清除舊的 Bot session，解決 Conflict 衝突
+    Render 重新部署時舊實例可能還在，需要先清除
+    """
+    import requests as req
+    max_retries = 10
+    for attempt in range(max_retries):
+        try:
+            # 先刪除 webhook（確保不用 webhook 模式）
+            req.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
+                json={"drop_pending_updates": True},
+                timeout=10
+            )
+            # 嘗試取得 updates 並清空
+            resp = req.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
+                json={"offset": -1, "timeout": 1},
+                timeout=10
+            )
+            if resp.ok:
+                print(f"[啟動] 舊 session 清除成功（第{attempt+1}次）")
+                return True
+        except Exception as e:
+            print(f"[啟動] 清除 session 第{attempt+1}次失敗：{e}")
+        time.sleep(3)
+    return False
+
+
 if __name__ == "__main__":
     print(f"Bot v10.0 啟動中... {tw_now()}")
+
+    # 步驟1：清除舊 session（解決 Conflict）
+    print("[啟動] 清除舊 session 中...")
+    clear_old_sessions()
+    # 等待舊實例完全停止（Render 部署緩衝時間）
+    time.sleep(5)
+    print("[啟動] 舊 session 清除完成，繼續啟動...")
+
+    # 步驟2：自適應參數初始化
     try:
         vol=get_market_volatility("BTC")
         rsk=get_risk_status()
@@ -509,6 +549,7 @@ if __name__ == "__main__":
         print(f"[啟動] 自適應參數初始化完成，波動率：{vol:.3f}")
     except Exception as e: print(f"[啟動] 初始化失敗：{e}")
 
+    # 步驟3：啟動背景執行緒
     threads=[
         threading.Thread(target=auto_push_loop,      args=(BOT_TOKEN,),daemon=True),
         threading.Thread(target=price_monitor_loop,   args=(BOT_TOKEN,),daemon=True),
@@ -519,7 +560,15 @@ if __name__ == "__main__":
     ]
     for t in threads: t.start()
 
-    app=ApplicationBuilder().token(BOT_TOKEN).build()
+    # 步驟4：啟動 Bot（加入 conflict 自動重試）
+    app = (ApplicationBuilder()
+           .token(BOT_TOKEN)
+           .get_updates_read_timeout(30)
+           .get_updates_write_timeout(30)
+           .get_updates_connect_timeout(30)
+           .get_updates_pool_timeout(30)
+           .build())
+
     for cmd,fn in [
         ("start",cmd_start),("a",cmd_analyse),("scan",cmd_scan),
         ("autoon",cmd_auto_on),("autooff",cmd_auto_off),
@@ -536,4 +585,5 @@ if __name__ == "__main__":
         app.add_handler(CommandHandler(cmd,fn))
 
     print("✅ Bot v10.0 已啟動！")
-    app.run_polling()
+    # drop_pending_updates=True：忽略舊的待處理訊息
+    app.run_polling(drop_pending_updates=True)
