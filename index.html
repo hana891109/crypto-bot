@@ -1,0 +1,1193 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>YUAN 加密貨幣分析系統</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap');
+
+  :root {
+    --bg:       #080c14;
+    --surface:  #0d1520;
+    --border:   #1a2840;
+    --accent:   #00d4ff;
+    --green:    #00ff88;
+    --red:      #ff3366;
+    --yellow:   #ffd700;
+    --text:     #c8d8f0;
+    --dim:      #4a6080;
+    --mono:     'Space Mono', monospace;
+    --sans:     'Syne', sans-serif;
+  }
+
+  * { margin:0; padding:0; box-sizing:border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* ─── GRID BACKGROUND ─── */
+  body::before {
+    content:'';
+    position:fixed; inset:0; z-index:0;
+    background-image:
+      linear-gradient(rgba(0,212,255,.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,212,255,.03) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events:none;
+  }
+
+  /* ─── HEADER ─── */
+  header {
+    position: sticky; top:0; z-index:100;
+    background: rgba(8,12,20,.9);
+    backdrop-filter: blur(20px);
+    border-bottom: 1px solid var(--border);
+    padding: 0 2rem;
+    display: flex; align-items:center; justify-content:space-between;
+    height: 60px;
+  }
+
+  .logo {
+    font-family: var(--mono);
+    font-size: 1.1rem;
+    color: var(--accent);
+    letter-spacing: .15em;
+    display:flex; align-items:center; gap:.6rem;
+  }
+  .logo-dot { width:8px; height:8px; background:var(--green); border-radius:50%; animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.4;transform:scale(.8)} }
+
+  .header-status {
+    font-family: var(--mono);
+    font-size:.75rem;
+    color: var(--dim);
+    display:flex; align-items:center; gap:1.5rem;
+  }
+  .status-item { display:flex; align-items:center; gap:.4rem; }
+  .status-dot { width:6px; height:6px; border-radius:50%; }
+  .dot-green { background:var(--green); box-shadow:0 0 6px var(--green); }
+  .dot-red   { background:var(--red); }
+
+  /* ─── MAIN LAYOUT ─── */
+  .container { position:relative; z-index:1; padding:1.5rem 2rem; max-width:1600px; margin:0 auto; }
+
+  /* ─── SECTION TITLE ─── */
+  .section-title {
+    font-family: var(--mono);
+    font-size:.7rem;
+    color: var(--accent);
+    letter-spacing:.2em;
+    text-transform:uppercase;
+    margin-bottom:1rem;
+    display:flex; align-items:center; gap:.8rem;
+  }
+  .section-title::after { content:''; flex:1; height:1px; background:var(--border); }
+
+  /* ─── CARDS ─── */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1.2rem;
+    position:relative;
+    overflow:hidden;
+  }
+  .card::before {
+    content:'';
+    position:absolute; top:0; left:0; right:0; height:1px;
+    background: linear-gradient(90deg, transparent, var(--accent), transparent);
+    opacity:.3;
+  }
+
+  /* ─── TOP STATS ROW ─── */
+  .stats-row { display:grid; grid-template-columns:repeat(5,1fr); gap:1rem; margin-bottom:1.5rem; }
+
+  .stat-card { padding:1rem 1.2rem; }
+  .stat-label { font-family:var(--mono); font-size:.65rem; color:var(--dim); letter-spacing:.1em; margin-bottom:.5rem; }
+  .stat-value { font-family:var(--mono); font-size:1.4rem; font-weight:700; }
+  .stat-sub   { font-family:var(--mono); font-size:.7rem; color:var(--dim); margin-top:.3rem; }
+  .val-green  { color:var(--green); }
+  .val-red    { color:var(--red); }
+  .val-yellow { color:var(--yellow); }
+  .val-accent { color:var(--accent); }
+
+  /* ─── MAIN GRID ─── */
+  .main-grid { display:grid; grid-template-columns:1fr 380px; gap:1.5rem; margin-bottom:1.5rem; }
+
+  /* ─── SIGNAL TABLE ─── */
+  .signal-table { width:100%; border-collapse:collapse; font-family:var(--mono); font-size:.8rem; }
+  .signal-table th {
+    text-align:left; padding:.6rem .8rem;
+    color:var(--dim); font-size:.65rem; letter-spacing:.1em;
+    border-bottom:1px solid var(--border);
+  }
+  .signal-table td { padding:.7rem .8rem; border-bottom:1px solid rgba(26,40,64,.5); }
+  .signal-table tr:hover td { background:rgba(0,212,255,.03); }
+  .signal-table tr:last-child td { border-bottom:none; }
+
+  .tag { display:inline-flex; align-items:center; gap:.3rem; padding:.15rem .5rem; border-radius:2px; font-size:.65rem; letter-spacing:.05em; }
+  .tag-long  { background:rgba(0,255,136,.1); color:var(--green); border:1px solid rgba(0,255,136,.2); }
+  .tag-short { background:rgba(255,51,102,.1); color:var(--red);   border:1px solid rgba(255,51,102,.2); }
+  .tag-a     { background:rgba(255,215,0,.1); color:var(--yellow); border:1px solid rgba(255,215,0,.2); }
+  .tag-b     { background:rgba(0,212,255,.1); color:var(--accent); border:1px solid rgba(0,212,255,.2); }
+  .tag-c     { background:rgba(74,96,128,.2); color:var(--dim); border:1px solid var(--border); }
+
+  /* ─── WINRATE BAR ─── */
+  .wr-bar { display:flex; align-items:center; gap:.6rem; }
+  .wr-track { flex:1; height:4px; background:var(--border); border-radius:2px; overflow:hidden; }
+  .wr-fill  { height:100%; border-radius:2px; transition:width .5s ease; }
+
+  /* ─── SCANNER PANEL ─── */
+  .scanner-panel { display:flex; flex-direction:column; gap:1rem; }
+
+  .scan-btn {
+    width:100%; padding:.9rem;
+    background: transparent;
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size:.8rem;
+    letter-spacing:.1em;
+    cursor:pointer;
+    border-radius:3px;
+    transition:all .2s;
+    display:flex; align-items:center; justify-content:center; gap:.6rem;
+  }
+  .scan-btn:hover { background:rgba(0,212,255,.08); box-shadow:0 0 20px rgba(0,212,255,.15); }
+  .scan-btn.active { background:rgba(0,212,255,.12); }
+  .scan-btn.danger { border-color:var(--red); color:var(--red); }
+  .scan-btn.danger:hover { background:rgba(255,51,102,.08); }
+  .scan-btn.success { border-color:var(--green); color:var(--green); }
+  .scan-btn.success:hover { background:rgba(0,255,136,.08); }
+
+  /* ─── PROGRESS ─── */
+  .progress-wrap { display:none; }
+  .progress-wrap.show { display:block; }
+  .progress-bar { height:3px; background:var(--border); border-radius:2px; overflow:hidden; margin:.5rem 0; }
+  .progress-fill { height:100%; background:linear-gradient(90deg,var(--accent),var(--green)); width:0%; transition:width .3s ease; }
+  .progress-text { font-family:var(--mono); font-size:.7rem; color:var(--dim); }
+
+  /* ─── MARKET OVERVIEW ─── */
+  .market-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:.8rem; }
+  .market-item { padding:.8rem; background:rgba(13,21,32,.8); border:1px solid var(--border); border-radius:3px; }
+  .market-coin { font-family:var(--mono); font-size:.85rem; color:var(--text); margin-bottom:.3rem; }
+  .market-price { font-family:var(--mono); font-size:1rem; font-weight:700; }
+  .market-change { font-family:var(--mono); font-size:.7rem; margin-top:.2rem; }
+
+  /* ─── BOTTOM GRID ─── */
+  .bottom-grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:1.5rem; }
+
+  /* ─── ML STATUS ─── */
+  .ml-bar-wrap { margin:.8rem 0; }
+  .ml-bar-label { font-family:var(--mono); font-size:.7rem; color:var(--dim); margin-bottom:.4rem; display:flex; justify-content:space-between; }
+  .ml-bar { height:6px; background:var(--border); border-radius:3px; overflow:hidden; }
+  .ml-fill { height:100%; border-radius:3px; background:linear-gradient(90deg,var(--red),var(--yellow),var(--green)); }
+
+  /* ─── SYKES ─── */
+  .sykes-item { display:flex; align-items:center; gap:.8rem; padding:.6rem 0; border-bottom:1px solid var(--border); }
+  .sykes-item:last-child { border-bottom:none; }
+  .sykes-icon { font-size:1.2rem; width:2rem; text-align:center; }
+  .sykes-info { flex:1; }
+  .sykes-name { font-family:var(--mono); font-size:.78rem; color:var(--text); }
+  .sykes-detail { font-family:var(--mono); font-size:.65rem; color:var(--dim); margin-top:.2rem; }
+  .sykes-score { font-family:var(--mono); font-size:1rem; font-weight:700; color:var(--yellow); }
+
+  /* ─── LOG ─── */
+  .log-wrap { height:180px; overflow-y:auto; font-family:var(--mono); font-size:.72rem; }
+  .log-wrap::-webkit-scrollbar { width:3px; }
+  .log-wrap::-webkit-scrollbar-track { background:transparent; }
+  .log-wrap::-webkit-scrollbar-thumb { background:var(--border); border-radius:2px; }
+  .log-line { padding:.3rem 0; border-bottom:1px solid rgba(26,40,64,.3); display:flex; gap:.8rem; }
+  .log-time { color:var(--dim); white-space:nowrap; }
+  .log-msg  { color:var(--text); }
+  .log-ok   { color:var(--green); }
+  .log-warn { color:var(--yellow); }
+  .log-err  { color:var(--red); }
+
+  /* ─── MODAL ─── */
+  .modal-overlay {
+    display:none; position:fixed; inset:0; z-index:200;
+    background:rgba(8,12,20,.85); backdrop-filter:blur(10px);
+    align-items:center; justify-content:center;
+  }
+  .modal-overlay.show { display:flex; }
+  .modal {
+    background:var(--surface); border:1px solid var(--border);
+    border-radius:6px; padding:2rem; max-width:560px; width:90%;
+    max-height:80vh; overflow-y:auto;
+    animation: modalIn .2s ease;
+  }
+  @keyframes modalIn { from{opacity:0;transform:scale(.96)} to{opacity:1;transform:scale(1)} }
+  .modal-title { font-family:var(--mono); color:var(--accent); font-size:.9rem; letter-spacing:.1em; margin-bottom:1.2rem; }
+  .modal-close { position:absolute; top:1rem; right:1rem; background:none; border:none; color:var(--dim); cursor:pointer; font-size:1.2rem; }
+
+  /* ─── SETTINGS ─── */
+  .setting-row { display:flex; align-items:center; justify-content:space-between; padding:.8rem 0; border-bottom:1px solid var(--border); }
+  .setting-label { font-family:var(--mono); font-size:.8rem; color:var(--text); }
+  .setting-sub { font-family:var(--mono); font-size:.65rem; color:var(--dim); margin-top:.2rem; }
+  .toggle { position:relative; width:44px; height:22px; }
+  .toggle input { display:none; }
+  .toggle-slider { position:absolute; inset:0; background:var(--border); border-radius:11px; cursor:pointer; transition:.2s; }
+  .toggle input:checked + .toggle-slider { background:var(--accent); }
+  .toggle-slider::after { content:''; position:absolute; width:16px; height:16px; background:#fff; border-radius:50%; top:3px; left:3px; transition:.2s; }
+  .toggle input:checked + .toggle-slider::after { transform:translateX(22px); }
+
+  input[type=number], input[type=text], select {
+    background:var(--bg); border:1px solid var(--border);
+    color:var(--text); font-family:var(--mono); font-size:.8rem;
+    padding:.4rem .8rem; border-radius:3px; width:100px;
+  }
+  input:focus, select:focus { outline:none; border-color:var(--accent); }
+
+  /* ─── SIGNAL DETAIL ─── */
+  .detail-grid { display:grid; grid-template-columns:1fr 1fr; gap:.8rem; margin:1rem 0; }
+  .detail-item { }
+  .detail-key { font-family:var(--mono); font-size:.65rem; color:var(--dim); margin-bottom:.3rem; }
+  .detail-val { font-family:var(--mono); font-size:.85rem; }
+
+  /* ─── CANDLESTICK MINI CHART ─── */
+  .mini-chart { display:flex; align-items:flex-end; gap:2px; height:50px; }
+  .candle { flex:1; border-radius:1px; min-width:3px; }
+
+  /* ─── RESPONSIVE ─── */
+  @media (max-width:1100px) {
+    .main-grid { grid-template-columns:1fr; }
+    .stats-row { grid-template-columns:repeat(3,1fr); }
+    .bottom-grid { grid-template-columns:1fr 1fr; }
+  }
+  @media (max-width:700px) {
+    .container { padding:1rem; }
+    .stats-row { grid-template-columns:repeat(2,1fr); }
+    .bottom-grid { grid-template-columns:1fr; }
+    .market-grid { grid-template-columns:repeat(2,1fr); }
+  }
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<header>
+  <div class="logo">
+    <div class="logo-dot"></div>
+    YUAN CRYPTO SYS
+  </div>
+  <div class="header-status">
+    <div class="status-item">
+      <div class="status-dot dot-green"></div>
+      <span id="hd-time">--:--:--</span>
+    </div>
+    <div class="status-item">
+      <div class="status-dot" id="okx-dot" style="background:var(--dim)"></div>
+      <span id="okx-status">OKX 連線中</span>
+    </div>
+    <div class="status-item">
+      <span id="hd-fg">FG: --</span>
+    </div>
+    <button class="scan-btn" style="width:auto;padding:.3rem .8rem;font-size:.7rem" onclick="openSettings()">⚙ 設定</button>
+  </div>
+</header>
+
+<div class="container">
+
+  <!-- TOP STATS -->
+  <div class="stats-row">
+    <div class="card stat-card">
+      <div class="stat-label">模擬總損益</div>
+      <div class="stat-value val-green" id="st-pnl">+$0.00</div>
+      <div class="stat-sub" id="st-pnl-pct">0.00%</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">模擬勝率</div>
+      <div class="stat-value val-accent" id="st-wr">0%</div>
+      <div class="stat-sub" id="st-trades">0勝 / 0敗</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">ML 學習狀態</div>
+      <div class="stat-value val-yellow" id="st-ml">0 筆</div>
+      <div class="stat-sub" id="st-ml-stage">初期學習中</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">當前持倉</div>
+      <div class="stat-value" id="st-pos">0</div>
+      <div class="stat-sub">模擬倉位</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">今日訊號</div>
+      <div class="stat-value val-accent" id="st-signals">0</div>
+      <div class="stat-sub">通過所有過濾</div>
+    </div>
+  </div>
+
+  <!-- MAIN GRID -->
+  <div class="main-grid">
+
+    <!-- SIGNAL TABLE -->
+    <div class="card">
+      <div class="section-title">訊號記錄</div>
+      <table class="signal-table">
+        <thead>
+          <tr>
+            <th>幣種</th>
+            <th>週期</th>
+            <th>方向</th>
+            <th>進場</th>
+            <th>止損</th>
+            <th>TP1</th>
+            <th>勝率</th>
+            <th>等級</th>
+            <th>賽克斯</th>
+            <th>時間</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="signal-tbody">
+          <tr>
+            <td colspan="11" style="text-align:center;color:var(--dim);padding:2rem;font-family:var(--mono);font-size:.75rem">
+              點擊「開始掃描」取得訊號
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- RIGHT PANEL -->
+    <div class="scanner-panel">
+
+      <!-- SCAN CONTROLS -->
+      <div class="card">
+        <div class="section-title">掃描控制</div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem;margin-bottom:.8rem">
+          <button class="scan-btn success" onclick="startScan()">▶ 開始掃描</button>
+          <button class="scan-btn danger" onclick="stopScan()">■ 停止</button>
+        </div>
+
+        <div class="progress-wrap" id="progress-wrap">
+          <div class="progress-text" id="progress-text">掃描中... 0/30</div>
+          <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+        </div>
+
+        <div style="margin-top:.8rem">
+          <div class="setting-row" style="padding:.5rem 0">
+            <div>
+              <div class="setting-label">自動掃描</div>
+              <div class="setting-sub">每5分鐘自動執行</div>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" id="auto-scan" onchange="toggleAutoScan(this)">
+              <div class="toggle-slider"></div>
+            </label>
+          </div>
+          <div class="setting-row" style="padding:.5rem 0">
+            <div>
+              <div class="setting-label">模擬交易</div>
+              <div class="setting-sub">自動記錄訊號</div>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" id="paper-mode" onchange="togglePaper(this)">
+              <div class="toggle-slider"></div>
+            </label>
+          </div>
+        </div>
+
+        <div style="font-family:var(--mono);font-size:.7rem;color:var(--dim);margin-top:.8rem" id="last-scan-time">上次掃描：從未</div>
+      </div>
+
+      <!-- MARKET MINI -->
+      <div class="card">
+        <div class="section-title">市場概覽</div>
+        <div class="market-grid" id="market-grid">
+          <div class="market-item"><div class="market-coin">BTC/USDT</div><div class="market-price val-accent" id="p-BTC">載入中</div><div class="market-change" id="c-BTC">—</div></div>
+          <div class="market-item"><div class="market-coin">ETH/USDT</div><div class="market-price val-accent" id="p-ETH">載入中</div><div class="market-change" id="c-ETH">—</div></div>
+          <div class="market-item"><div class="market-coin">SOL/USDT</div><div class="market-price val-accent" id="p-SOL">載入中</div><div class="market-change" id="c-SOL">—</div></div>
+          <div class="market-item"><div class="market-coin">BNB/USDT</div><div class="market-price val-accent" id="p-BNB">載入中</div><div class="market-change" id="c-BNB">—</div></div>
+          <div class="market-item"><div class="market-coin">XRP/USDT</div><div class="market-price val-accent" id="p-XRP">載入中</div><div class="market-change" id="c-XRP">—</div></div>
+          <div class="market-item"><div class="market-coin">DOGE/USDT</div><div class="market-price val-accent" id="p-DOGE">載入中</div><div class="market-change" id="c-DOGE">—</div></div>
+        </div>
+      </div>
+
+      <!-- QUICK ACTIONS -->
+      <div class="card">
+        <div class="section-title">快速操作</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem">
+          <button class="scan-btn success" onclick="recordWin()">✅ 記錄獲利</button>
+          <button class="scan-btn danger"  onclick="recordLoss()">❌ 記錄虧損</button>
+          <button class="scan-btn" onclick="resetML()">🔄 重置ML</button>
+          <button class="scan-btn" onclick="showMLStatus()">🤖 ML狀態</button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- BOTTOM GRID -->
+  <div class="bottom-grid">
+
+    <!-- ML STATUS -->
+    <div class="card">
+      <div class="section-title">ML 學習進度</div>
+      <div id="ml-detail">
+        <div class="ml-bar-wrap">
+          <div class="ml-bar-label"><span>樣本充足度</span><span id="ml-sample-count">0 / 200 筆</span></div>
+          <div class="ml-bar"><div class="ml-fill" id="ml-bar-fill" style="width:0%"></div></div>
+        </div>
+        <div class="ml-bar-wrap">
+          <div class="ml-bar-label"><span>歷史勝率</span><span id="ml-wr-pct">0%</span></div>
+          <div class="ml-bar"><div class="ml-fill" id="ml-wr-fill" style="width:0%"></div></div>
+        </div>
+        <div style="font-family:var(--mono);font-size:.72rem;color:var(--dim);margin-top:.8rem;line-height:1.6">
+          <div>• &lt;30筆：固定基準預測</div>
+          <div>• 30~200筆：混合預測模式</div>
+          <div>• &gt;200筆：完全ML預測</div>
+        </div>
+        <div style="font-family:var(--mono);font-size:.75rem;margin-top:.8rem" id="ml-stage-text">🔵 初期學習中</div>
+      </div>
+    </div>
+
+    <!-- SYKES SIGNALS -->
+    <div class="card">
+      <div class="section-title">賽克斯策略訊號</div>
+      <div id="sykes-list">
+        <div style="font-family:var(--mono);font-size:.75rem;color:var(--dim);text-align:center;padding:1rem">
+          掃描後顯示賽克斯訊號
+        </div>
+      </div>
+    </div>
+
+    <!-- SYSTEM LOG -->
+    <div class="card">
+      <div class="section-title">系統記錄</div>
+      <div class="log-wrap" id="log-wrap"></div>
+    </div>
+
+  </div>
+</div>
+
+<!-- MODAL: 訊號詳情 -->
+<div class="modal-overlay" id="signal-modal">
+  <div class="modal" style="position:relative">
+    <button class="modal-close" onclick="closeModal('signal-modal')">✕</button>
+    <div class="modal-title" id="modal-title">訊號詳情</div>
+    <div id="modal-content"></div>
+  </div>
+</div>
+
+<!-- MODAL: 設定 -->
+<div class="modal-overlay" id="settings-modal">
+  <div class="modal" style="position:relative;max-width:480px">
+    <button class="modal-close" onclick="closeModal('settings-modal')">✕</button>
+    <div class="modal-title">⚙ 系統設定</div>
+
+    <div class="setting-row">
+      <div><div class="setting-label">OKX API Key</div><div class="setting-sub">留空使用公開API</div></div>
+      <input type="text" id="s-apikey" placeholder="可選">
+    </div>
+    <div class="setting-row">
+      <div><div class="setting-label">掃描間隔（分鐘）</div><div class="setting-sub">自動掃描週期</div></div>
+      <input type="number" id="s-interval" value="5" min="1" max="60">
+    </div>
+    <div class="setting-row">
+      <div><div class="setting-label">最低勝率門檻</div><div class="setting-sub">低於此值不顯示</div></div>
+      <input type="number" id="s-minwr" value="0" min="0" max="90">
+    </div>
+    <div class="setting-row">
+      <div><div class="setting-label">賽克斯策略</div><div class="setting-sub">顯示賽克斯訊號</div></div>
+      <label class="toggle"><input type="checkbox" id="s-sykes" checked><div class="toggle-slider"></div></label>
+    </div>
+    <div class="setting-row">
+      <div><div class="setting-label">音效通知</div><div class="setting-sub">訊號出現時提示音</div></div>
+      <label class="toggle"><input type="checkbox" id="s-sound"><div class="toggle-slider"></div></label>
+    </div>
+
+    <button class="scan-btn success" style="margin-top:1rem" onclick="saveSettings()">💾 儲存設定</button>
+  </div>
+</div>
+
+<!-- MODAL: ML狀態 -->
+<div class="modal-overlay" id="ml-modal">
+  <div class="modal" style="position:relative;max-width:420px">
+    <button class="modal-close" onclick="closeModal('ml-modal')">✕</button>
+    <div class="modal-title">🤖 ML 學習狀態</div>
+    <div id="ml-modal-content"></div>
+  </div>
+</div>
+
+<script>
+// ──────────────────────────────────────────────
+// 全域狀態
+// ──────────────────────────────────────────────
+const STATE = {
+  signals:    JSON.parse(localStorage.getItem('signals') || '[]'),
+  mlData:     JSON.parse(localStorage.getItem('mlData') || '{"samples":0,"wins":0}'),
+  paperData:  JSON.parse(localStorage.getItem('paperData') || '{"capital":10000,"pnl":0,"wins":0,"losses":0,"positions":[]}'),
+  settings:   JSON.parse(localStorage.getItem('settings') || '{"interval":5,"minWR":0,"sykes":true,"sound":false}'),
+  scanning:   false,
+  autoTimer:  null,
+  todaySignals: 0,
+};
+
+const COINS = ['BTC','ETH','BNB','XRP','SOL','ADA','DOGE','TRX','AVAX','SHIB',
+               'DOT','LINK','MATIC','UNI','LTC','APT','NEAR','ATOM','XLM',
+               'FIL','HBAR','ARB','OP','INJ','SUI','VET','GRT','AAVE','MKR'];
+const TFS   = ['1h','4h','1d'];
+
+// ──────────────────────────────────────────────
+// OKX API
+// ──────────────────────────────────────────────
+async function fetchKlines(symbol, bar='4H', limit=100) {
+  const url = `https://www.okx.com/api/v5/market/candles?instId=${symbol}-USDT&bar=${bar}&limit=${limit}`;
+  try {
+    const r = await fetch(url, {signal: AbortSignal.timeout(8000)});
+    const d = await r.json();
+    if (d.code !== '0' || !d.data?.length) return null;
+    // OKX 最新在前，反轉
+    return d.data.reverse().map(b => ({
+      t:+b[0], o:+b[1], h:+b[2], l:+b[3], c:+b[4], v:+b[5]
+    }));
+  } catch(e) { return null; }
+}
+
+async function fetchTicker(symbol) {
+  try {
+    const r = await fetch(`https://www.okx.com/api/v5/market/ticker?instId=${symbol}-USDT`,
+                          {signal: AbortSignal.timeout(5000)});
+    const d = await r.json();
+    if (d.code !== '0' || !d.data?.length) return null;
+    return d.data[0];
+  } catch(e) { return null; }
+}
+
+async function fetchFearGreed() {
+  try {
+    const r = await fetch('https://api.alternative.me/fng/?limit=1',
+                          {signal: AbortSignal.timeout(5000)});
+    const d = await r.json();
+    return d.data[0];
+  } catch(e) { return null; }
+}
+
+// ──────────────────────────────────────────────
+// 技術分析
+// ──────────────────────────────────────────────
+function calcEMA(data, period) {
+  const k = 2 / (period + 1);
+  let ema = data[0];
+  return data.map((v,i) => { if(i===0){return ema;} ema=v*k+ema*(1-k); return ema; });
+}
+
+function calcRSI(closes, period=14) {
+  if (closes.length < period+1) return 50;
+  let gains=0, losses=0;
+  for(let i=1;i<=period;i++){
+    const d=closes[i]-closes[i-1];
+    if(d>0) gains+=d; else losses-=d;
+  }
+  let ag=gains/period, al=losses/period;
+  for(let i=period+1;i<closes.length;i++){
+    const d=closes[i]-closes[i-1];
+    ag=(ag*(period-1)+(d>0?d:0))/period;
+    al=(al*(period-1)+(d<0?-d:0))/period;
+  }
+  if(al===0) return 100;
+  return Math.round(100-(100/(1+ag/al)));
+}
+
+function calcMACD(closes) {
+  const ema12=calcEMA(closes,12), ema26=calcEMA(closes,26);
+  const macdLine=ema12.map((v,i)=>v-ema26[i]);
+  const signal=calcEMA(macdLine,9);
+  const hist=macdLine.map((v,i)=>v-signal[i]);
+  const n=closes.length-1;
+  return {macd:macdLine[n], signal:signal[n], hist:hist[n]};
+}
+
+function calcATR(bars, period=14) {
+  const trs=bars.slice(1).map((b,i)=>Math.max(b.h-b.l,Math.abs(b.h-bars[i].c),Math.abs(b.l-bars[i].c)));
+  if(!trs.length) return 0;
+  return trs.slice(-period).reduce((a,b)=>a+b,0)/Math.min(trs.length,period);
+}
+
+function calcADX(bars, period=14) {
+  if(bars.length<period*2+1) return {adx:0,pdi:0,mdi:0};
+  const pdms=[],mdms=[],trs=[];
+  for(let i=1;i<bars.length;i++){
+    const hd=bars[i].h-bars[i-1].h, ld=bars[i-1].l-bars[i].l;
+    pdms.push(hd>ld&&hd>0?hd:0);
+    mdms.push(ld>hd&&ld>0?ld:0);
+    trs.push(Math.max(bars[i].h-bars[i].l,Math.abs(bars[i].h-bars[i-1].c),Math.abs(bars[i].l-bars[i-1].c)));
+  }
+  const smTR=trs.slice(0,period).reduce((a,b)=>a+b,0);
+  const smP=pdms.slice(0,period).reduce((a,b)=>a+b,0);
+  const smM=mdms.slice(0,period).reduce((a,b)=>a+b,0);
+  let aTR=smTR,aP=smP,aM=smM;
+  const dxs=[];
+  for(let i=period;i<trs.length;i++){
+    aTR=aTR-aTR/period+trs[i];
+    aP=aP-aP/period+pdms[i];
+    aM=aM-aM/period+mdms[i];
+    const pdi=100*aP/Math.max(aTR,1e-10), mdi=100*aM/Math.max(aTR,1e-10);
+    const dx=100*Math.abs(pdi-mdi)/Math.max(pdi+mdi,1e-10);
+    dxs.push({dx,pdi,mdi});
+  }
+  if(!dxs.length) return {adx:0,pdi:0,mdi:0};
+  const last=dxs.slice(-period);
+  const adx=last.reduce((a,b)=>a+b.dx,0)/last.length;
+  const {pdi,mdi}=dxs[dxs.length-1];
+  return {adx:Math.round(adx*10)/10, pdi:Math.round(pdi*10)/10, mdi:Math.round(mdi*10)/10};
+}
+
+function calcSupertrend(bars, period=10, mult=3.0) {
+  if(bars.length<period+2) return {dir:0};
+  let dir=1, fu=0, fd=0;
+  for(let i=period;i<bars.length;i++){
+    const atr=calcATR(bars.slice(Math.max(0,i-period),i+1),period);
+    const hl2=(bars[i].h+bars[i].l)/2;
+    const up=hl2+mult*atr, dn=hl2-mult*atr;
+    if(i===period){fu=up;fd=dn;}
+    else {
+      fu=bars[i-1].c>fu?Math.min(up,fu):up;
+      fd=bars[i-1].c<fd?Math.max(dn,fd):dn;
+      if(bars[i].c>fu) dir=1;
+      else if(bars[i].c<fd) dir=-1;
+    }
+  }
+  return {dir};
+}
+
+function calcSykesScore(bars) {
+  if(bars.length<30) return {score:0,signal:'無',detail:''};
+  const n=bars.length-1;
+  const closes=bars.map(b=>b.c);
+  const vols=bars.map(b=>b.v);
+  const avgVol=vols.slice(-21,-1).reduce((a,b)=>a+b,0)/20;
+  const lastVol=vols[n];
+  const volMult=Math.round(lastVol/Math.max(avgVol,1e-10)*10)/10;
+  const recentHigh=Math.max(...bars.slice(-21,-1).map(b=>b.h));
+  const recentLow=Math.min(...bars.slice(-21,-1).map(b=>b.l));
+  const price=closes[n];
+  const openPrice=closes[Math.max(0,n-19)];
+  const dayChange=Math.round((price-openPrice)/Math.max(openPrice,1e-10)*1000)/10;
+
+  let score=0, signal='無', detail='';
+
+  if(volMult>=5 && price>recentHigh){
+    score=5; signal='🚀 爆量突破'; detail=`量比${volMult}x 突破${recentHigh.toFixed(2)}`;
+  } else if(dayChange>=15){
+    score=volMult<0.7?6:4; signal='📉 強勢做空'; detail=`漲${dayChange}% ${volMult<0.7?'量萎縮':'量持平'}`;
+  } else if(dayChange<=-20){
+    score=volMult<0.7?5:3; signal='🔄 超跌反彈'; detail=`跌${Math.abs(dayChange)}% ${volMult<0.7?'量萎縮':'量持平'}`;
+  } else if(bars.length>=3){
+    const prevClose=closes[n-1];
+    const prev2High=Math.max(...bars.slice(-21,-1).map(b=>b.h));
+    if(prevClose>prev2High&&price<prevClose){
+      const bounce=(prevClose-price)/Math.max(prevClose,1e-10)*100;
+      if(bounce<3){score=3;signal='↩️ 突破回踩';detail=`回踩${Math.round(bounce*10)/10}%`;}
+    }
+  }
+  if(score===0&&volMult>=3){score=2;detail=`量比${volMult}x 觀察中`;}
+
+  return {score:Math.min(score,10), signal, detail, volMult, dayChange};
+}
+
+// ──────────────────────────────────────────────
+// 主分析函數
+// ──────────────────────────────────────────────
+async function analyzeSymbol(symbol, tf) {
+  const barMap={'1h':'1H','4h':'4H','1d':'1D'};
+  const bars=await fetchKlines(symbol, barMap[tf]||'4H', 150);
+  if(!bars||bars.length<50) return null;
+
+  const closes=bars.map(b=>b.c);
+  const highs=bars.map(b=>b.h);
+  const lows=bars.map(b=>b.l);
+  const vols=bars.map(b=>b.v);
+  const n=bars.length-1;
+  const price=closes[n];
+
+  // 指標
+  const ema20=calcEMA(closes,20)[n];
+  const ema50=calcEMA(closes,50)[n];
+  const ema200=calcEMA(closes,Math.min(200,closes.length-1))[n];
+  const rsi=calcRSI(closes);
+  const {hist,macd,signal:macdSig}=calcMACD(closes);
+  const atr=calcATR(bars);
+  const adx=calcADX(bars);
+  const st=calcSupertrend(bars);
+  const vwap=bars.slice(-20).reduce((s,b)=>s+(b.h+b.l+b.c)/3*b.v,0)/vols.slice(-20).reduce((a,b)=>a+b,0);
+  const avgVol=vols.slice(-21,-1).reduce((a,b)=>a+b,0)/20;
+  const lastVol=vols[n];
+  const volRatio=Math.round(lastVol/Math.max(avgVol,1e-10)*10)/10;
+  const sykes=calcSykesScore(bars);
+
+  // 評分
+  let ls=0, ss=0;
+
+  // EMA
+  if(price>ema20&&ema20>ema50&&ema50>ema200){ls+=6;}
+  else if(price<ema20&&ema20<ema50&&ema50<ema200){ss+=6;}
+  else if(price>ema20&&ema20>ema50){ls+=3;}
+  else if(price<ema20&&ema20<ema50){ss+=3;}
+  else if(price>ema50){ls+=1;} else{ss+=1;}
+
+  // Supertrend
+  if(st.dir===1){ls+=4;} else if(st.dir===-1){ss+=4;}
+
+  // RSI
+  if(rsi<30){ls+=2;} else if(rsi<42){ls+=1;}
+  else if(rsi>70){ss+=2;} else if(rsi>58){ss+=1;}
+
+  // MACD
+  if(hist>0&&macd>macdSig){ls+=2;} else if(hist<0&&macd<macdSig){ss+=2;}
+
+  // VWAP
+  if(price>vwap){ls+=2;} else{ss+=2;}
+
+  // ADX
+  if(adx.adx>=40){if(adx.pdi>adx.mdi)ls+=3;else ss+=3;}
+  else if(adx.adx>=25){if(adx.pdi>adx.mdi)ls+=2;else ss+=2;}
+  else if(adx.adx>=15){if(adx.pdi>adx.mdi)ls+=1;else ss+=1;}
+
+  // 成交量
+  const priceUp=closes[n]>closes[n-1];
+  if(volRatio>=1.5&&priceUp){ls+=2;} else if(volRatio>=1.5&&!priceUp){ss+=2;}
+
+  // Sykes
+  if(sykes.score>0){
+    if(sykes.signal.includes('突破')||sykes.signal.includes('反彈')){ls+=Math.min(sykes.score,8);}
+    else if(sykes.signal.includes('做空')){ss+=Math.min(sykes.score,8);}
+  }
+
+  const diff=Math.abs(ls-ss);
+  const mx=Math.max(ls,ss);
+  if(diff<2||mx<4||ls===ss) return null;
+
+  const direction=ls>ss?'long':'short';
+
+  // 極端RSI否決
+  if(direction==='long'&&rsi>90) return null;
+  if(direction==='short'&&rsi<10) return null;
+
+  // 基礎勝率估算
+  const mlSamples=STATE.mlData.samples||0;
+  const mlWins=STATE.mlData.wins||0;
+  let wrPct;
+  if(mlSamples<30){
+    const featQ=Math.min((diff/15+adx.adx/60+volRatio/5)/3,1);
+    wrPct=Math.round((50+featQ*20)*10)/10;
+  } else {
+    const histWR=mlWins/mlSamples*100;
+    const weight=Math.min(mlSamples/200,1);
+    wrPct=Math.round((histWR*weight+60*(1-weight))*10)/10;
+  }
+
+  // 斐波納契出場
+  const swHigh=Math.max(...highs.slice(-50));
+  const swLow=Math.min(...lows.slice(-50));
+  const diff2=Math.max(swHigh-swLow,price*0.001);
+  let sl,tp1,tp2,tp3;
+  if(direction==='long'){
+    sl=Math.round((swHigh-diff2*0.618)*1e8)/1e8;
+    if(sl>=price)sl=Math.round((price-atr*2)*1e8)/1e8;
+    tp1=Math.round((swHigh+diff2*0.272)*1e8)/1e8;
+    tp2=Math.round((swHigh+diff2*0.618)*1e8)/1e8;
+    tp3=Math.round((swHigh+diff2*1.618)*1e8)/1e8;
+  } else {
+    sl=Math.round((swLow+diff2*0.618)*1e8)/1e8;
+    if(sl<=price)sl=Math.round((price+atr*2)*1e8)/1e8;
+    tp1=Math.round((swLow-diff2*0.272)*1e8)/1e8;
+    tp2=Math.round((swLow-diff2*0.618)*1e8)/1e8;
+    tp3=Math.round((swLow-diff2*1.618)*1e8)/1e8;
+  }
+
+  const risk=Math.abs(price-sl);
+  const reward=Math.abs(tp1-price);
+  const rr=Math.round(reward/Math.max(risk,1e-10)*10)/10;
+  if(rr<0.8) return null;
+
+  // 訊號等級
+  let grade;
+  if(mlSamples<30) grade='📊 學習中';
+  else if(wrPct>=80) grade='🏆 A';
+  else if(wrPct>=70) grade='⭐ B';
+  else grade='✅ C';
+
+  return {
+    symbol, tf, direction, price,
+    entry:Math.round(price*1e8)/1e8,
+    sl, tp1, tp2, tp3, rr,
+    ema20:Math.round(ema20*1e6)/1e6,
+    ema50:Math.round(ema50*1e6)/1e6,
+    rsi, macd:Math.round(macd*1e6)/1e6,
+    hist:Math.round(hist*1e6)/1e6,
+    adx:adx.adx, pdi:adx.pdi, mdi:adx.mdi,
+    supertrend:st.dir===1?'📈 多頭':'📉 空頭',
+    vwap:Math.round(vwap*1e6)/1e6,
+    atr:Math.round(atr*1e6)/1e6,
+    volRatio,
+    sykes,
+    winrate:wrPct, grade,
+    longScore:ls, shortScore:ss,
+    time:new Date().toLocaleTimeString('zh-TW',{hour12:false}),
+    timestamp:Date.now(),
+  };
+}
+
+// ──────────────────────────────────────────────
+// 掃描
+// ──────────────────────────────────────────────
+let scanAbort=false;
+
+async function startScan() {
+  if(STATE.scanning) return;
+  STATE.scanning=true; scanAbort=false;
+  const prog=document.getElementById('progress-wrap');
+  const fill=document.getElementById('progress-fill');
+  const txt=document.getElementById('progress-text');
+  prog.classList.add('show');
+  addLog('開始掃描 30 個幣種 × 3 週期...','ok');
+
+  const tasks=[];
+  COINS.forEach(c=>TFS.forEach(tf=>tasks.push({c,tf})));
+  let done=0; const total=tasks.length;
+  const newSignals=[];
+
+  for(const {c,tf} of tasks){
+    if(scanAbort) break;
+    fill.style.width=`${done/total*100}%`;
+    txt.textContent=`掃描中... ${c} ${tf} (${done}/${total})`;
+    try{
+      const r=await analyzeSymbol(c,tf);
+      if(r){
+        newSignals.push(r);
+        STATE.todaySignals++;
+        addLog(`✅ ${c} ${tf} ${r.direction==='long'?'做多':'做空'} 勝率${r.winrate}%`,'ok');
+        // 模擬交易自動開倉
+        if(document.getElementById('paper-mode').checked){
+          openPaperTrade(r);
+        }
+      }
+    }catch(e){}
+    done++;
+    await new Promise(res=>setTimeout(res,120));
+  }
+
+  fill.style.width='100%';
+  txt.textContent=`掃描完成！找到 ${newSignals.length} 個訊號`;
+
+  // 合併並存儲
+  STATE.signals=([...newSignals,...STATE.signals]).slice(0,100);
+  localStorage.setItem('signals',JSON.stringify(STATE.signals));
+  STATE.scanning=false;
+  document.getElementById('last-scan-time').textContent=`上次掃描：${new Date().toLocaleTimeString('zh-TW',{hour12:false})}`;
+  document.getElementById('st-signals').textContent=STATE.todaySignals;
+
+  renderSignalTable();
+  renderSykes();
+  updateStats();
+
+  if(newSignals.length===0) addLog('本次掃描無強力訊號','warn');
+  else addLog(`掃描完成，共 ${newSignals.length} 個訊號`,'ok');
+
+  setTimeout(()=>prog.classList.remove('show'), 3000);
+}
+
+function stopScan() {
+  scanAbort=true; STATE.scanning=false;
+  addLog('掃描已停止','warn');
+}
+
+// ──────────────────────────────────────────────
+// 模擬交易
+// ──────────────────────────────────────────────
+function openPaperTrade(signal) {
+  const lev=Math.min(Math.max(10,Math.round(signal.winrate/2)),50);
+  const margin=STATE.paperData.capital*0.05/lev;
+  STATE.paperData.positions.push({
+    id:Date.now(), symbol:signal.symbol, tf:signal.tf,
+    direction:signal.direction, entry:signal.entry,
+    sl:signal.sl, tp1:signal.tp1, tp2:signal.tp2, tp3:signal.tp3,
+    leverage:lev, margin, tp1Hit:false,
+    openTime:new Date().toLocaleTimeString(),
+  });
+  localStorage.setItem('paperData',JSON.stringify(STATE.paperData));
+  document.getElementById('st-pos').textContent=STATE.paperData.positions.length;
+}
+
+function recordWin() {
+  STATE.mlData.samples++;
+  STATE.mlData.wins++;
+  STATE.paperData.pnl+=150;
+  STATE.paperData.wins++;
+  localStorage.setItem('mlData',JSON.stringify(STATE.mlData));
+  localStorage.setItem('paperData',JSON.stringify(STATE.paperData));
+  addLog('記錄獲利 +$150 ML已更新','ok');
+  updateStats(); updateMLDisplay();
+}
+
+function recordLoss() {
+  STATE.mlData.samples++;
+  STATE.paperData.pnl-=80;
+  STATE.paperData.losses++;
+  localStorage.setItem('mlData',JSON.stringify(STATE.mlData));
+  localStorage.setItem('paperData',JSON.stringify(STATE.paperData));
+  addLog('記錄虧損 -$80 ML已更新','warn');
+  updateStats(); updateMLDisplay();
+}
+
+function resetML() {
+  if(!confirm('確定重置ML數據？')) return;
+  STATE.mlData={samples:0,wins:0};
+  localStorage.setItem('mlData',JSON.stringify(STATE.mlData));
+  addLog('ML數據已重置，重新學習','warn');
+  updateMLDisplay();
+}
+
+// ──────────────────────────────────────────────
+// 自動掃描
+// ──────────────────────────────────────────────
+function toggleAutoScan(el) {
+  if(el.checked){
+    const mins=parseInt(document.getElementById('s-interval').value)||5;
+    STATE.autoTimer=setInterval(startScan, mins*60000);
+    addLog(`自動掃描已開啟，每${mins}分鐘執行`,'ok');
+  } else {
+    clearInterval(STATE.autoTimer);
+    addLog('自動掃描已關閉','warn');
+  }
+}
+
+function togglePaper(el) {
+  addLog(el.checked?'模擬交易已開啟':'模擬交易已關閉', el.checked?'ok':'warn');
+}
+
+// ──────────────────────────────────────────────
+// 渲染
+// ──────────────────────────────────────────────
+function renderSignalTable() {
+  const tbody=document.getElementById('signal-tbody');
+  if(!STATE.signals.length){
+    tbody.innerHTML='<tr><td colspan="11" style="text-align:center;color:var(--dim);padding:2rem;font-family:var(--mono);font-size:.75rem">暫無訊號，點擊「開始掃描」</td></tr>';
+    return;
+  }
+  tbody.innerHTML=STATE.signals.slice(0,20).map((s,i)=>{
+    const dirTag=s.direction==='long'?'<span class="tag tag-long">▲ 做多</span>':'<span class="tag tag-short">▼ 做空</span>';
+    const gradeTag=s.grade.includes('A')?'<span class="tag tag-a">A</span>':s.grade.includes('B')?'<span class="tag tag-b">B</span>':'<span class="tag tag-c">C</span>';
+    const wrColor=s.winrate>=75?'var(--green)':s.winrate>=60?'var(--yellow)':'var(--dim)';
+    const sykesStr=s.sykes?.score>0?`<span style="color:var(--yellow);font-size:.65rem">${s.sykes.score}分</span>`:'<span style="color:var(--dim)">—</span>';
+    return `<tr onclick="showSignalDetail(${i})" style="cursor:pointer">
+      <td style="font-weight:700;color:var(--text)">${s.symbol}</td>
+      <td style="color:var(--dim)">${s.tf}</td>
+      <td>${dirTag}</td>
+      <td style="font-family:var(--mono)">${s.entry}</td>
+      <td style="font-family:var(--mono);color:var(--red)">${s.sl}</td>
+      <td style="font-family:var(--mono);color:var(--green)">${s.tp1}</td>
+      <td>
+        <div class="wr-bar">
+          <div class="wr-track"><div class="wr-fill" style="width:${s.winrate}%;background:${wrColor}"></div></div>
+          <span style="font-family:var(--mono);font-size:.72rem;color:${wrColor};white-space:nowrap">${s.winrate}%</span>
+        </div>
+      </td>
+      <td>${gradeTag}</td>
+      <td>${sykesStr}</td>
+      <td style="color:var(--dim);font-size:.7rem">${s.time}</td>
+      <td><button onclick="event.stopPropagation();removeSignal(${i})" style="background:none;border:none;color:var(--dim);cursor:pointer;font-size:.9rem">✕</button></td>
+    </tr>`;
+  }).join('');
+}
+
+function renderSykes() {
+  const list=document.getElementById('sykes-list');
+  const sykes=STATE.signals.filter(s=>s.sykes?.score>0).slice(0,5);
+  if(!sykes.length){
+    list.innerHTML='<div style="font-family:var(--mono);font-size:.75rem;color:var(--dim);text-align:center;padding:1rem">掃描後顯示賽克斯訊號</div>';
+    return;
+  }
+  list.innerHTML=sykes.map(s=>`
+    <div class="sykes-item">
+      <div class="sykes-icon">${s.sykes.signal.charAt(0)}</div>
+      <div class="sykes-info">
+        <div class="sykes-name">${s.symbol} ${s.tf} · ${s.sykes.signal}</div>
+        <div class="sykes-detail">${s.sykes.detail}</div>
+      </div>
+      <div class="sykes-score">${s.sykes.score}</div>
+    </div>`).join('');
+}
+
+function updateStats() {
+  const pd=STATE.paperData;
+  const pnl=pd.pnl||0;
+  const total=pd.wins+pd.losses;
+  const wr=total?Math.round(pd.wins/total*1000)/10:0;
+
+  document.getElementById('st-pnl').textContent=(pnl>=0?'+$':'-$')+Math.abs(pnl).toFixed(2);
+  document.getElementById('st-pnl').className='stat-value '+(pnl>=0?'val-green':'val-red');
+  document.getElementById('st-pnl-pct').textContent=(pnl/10000*100).toFixed(2)+'%';
+  document.getElementById('st-wr').textContent=wr+'%';
+  document.getElementById('st-trades').textContent=`${pd.wins}勝 / ${pd.losses}敗`;
+  document.getElementById('st-ml').textContent=STATE.mlData.samples+' 筆';
+  document.getElementById('st-pos').textContent=pd.positions?.length||0;
+}
+
+function updateMLDisplay() {
+  const s=STATE.mlData.samples||0, w=STATE.mlData.wins||0;
+  const wr=s?Math.round(w/s*1000)/10:0;
+  document.getElementById('ml-sample-count').textContent=`${s} / 200 筆`;
+  document.getElementById('ml-bar-fill').style.width=Math.min(s/200*100,100)+'%';
+  document.getElementById('ml-wr-pct').textContent=wr+'%';
+  document.getElementById('ml-wr-fill').style.width=wr+'%';
+  const stage=s<30?'🔵 初期學習中（<30筆）':s<100?'🟡 中期學習（30~200筆）':'🟢 成熟階段（>200筆）';
+  document.getElementById('ml-stage-text').textContent=stage;
+  document.getElementById('st-ml-stage').textContent=stage.replace(/🔵|🟡|🟢/,'').trim().split('（')[0];
+  document.getElementById('st-ml').textContent=s+' 筆';
+}
+
+// ──────────────────────────────────────────────
+// 市場價格
+// ──────────────────────────────────────────────
+async function updateMarketPrices() {
+  const symbols=['BTC','ETH','SOL','BNB','XRP','DOGE'];
+  for(const sym of symbols){
+    const t=await fetchTicker(sym);
+    if(!t) continue;
+    const price=parseFloat(t.last);
+    const change=parseFloat(t.open24h);
+    const pct=Math.round((price-change)/change*1000)/10;
+    const el=document.getElementById(`p-${sym}`);
+    const cel=document.getElementById(`c-${sym}`);
+    if(el) el.textContent=price>100?price.toFixed(2):price.toFixed(4);
+    if(cel){
+      cel.textContent=(pct>=0?'+':'')+pct+'%';
+      cel.style.color=pct>=0?'var(--green)':'var(--red)';
+    }
+  }
+  document.getElementById('okx-dot').style.background='var(--green)';
+  document.getElementById('okx-status').textContent='OKX 已連線';
+}
+
+async function updateFearGreed() {
+  const fg=await fetchFearGreed();
+  if(fg) document.getElementById('hd-fg').textContent=`FG: ${fg.value}`;
+}
+
+// ──────────────────────────────────────────────
+// 時鐘
+// ──────────────────────────────────────────────
+function updateClock() {
+  document.getElementById('hd-time').textContent=new Date().toLocaleTimeString('zh-TW',{hour12:false,timeZone:'Asia/Taipei'});
+}
+
+// ──────────────────────────────────────────────
+// LOG
+// ──────────────────────────────────────────────
+function addLog(msg, type='') {
+  const wrap=document.getElementById('log-wrap');
+  const time=new Date().toLocaleTimeString('zh-TW',{hour12:false});
+  const cls=type==='ok'?'log-ok':type==='warn'?'log-warn':type==='err'?'log-err':'';
+  const div=document.createElement('div');
+  div.className='log-line';
+  div.innerHTML=`<span class="log-time">${time}</span><span class="log-msg ${cls}">${msg}</span>`;
+  wrap.insertBefore(div,wrap.firstChild);
+  if(wrap.children.length>50) wrap.removeChild(wrap.lastChild);
+}
+
+// ──────────────────────────────────────────────
+// MODAL
+// ──────────────────────────────────────────────
+function showSignalDetail(idx) {
+  const s=STATE.signals[idx];
+  if(!s) return;
+  document.getElementById('modal-title').textContent=`${s.symbol}USDT · ${s.tf} · ${s.direction==='long'?'做多':'做空'}`;
+  document.getElementById('modal-content').innerHTML=`
+    <div class="detail-grid">
+      <div class="detail-item"><div class="detail-key">進場價</div><div class="detail-val val-accent">${s.entry}</div></div>
+      <div class="detail-item"><div class="detail-key">止損</div><div class="detail-val val-red">${s.sl}</div></div>
+      <div class="detail-item"><div class="detail-key">止盈1</div><div class="detail-val val-green">${s.tp1}</div></div>
+      <div class="detail-item"><div class="detail-key">止盈2</div><div class="detail-val val-green">${s.tp2}</div></div>
+      <div class="detail-item"><div class="detail-key">止盈3</div><div class="detail-val val-green">${s.tp3}</div></div>
+      <div class="detail-item"><div class="detail-key">風報比</div><div class="detail-val">1:${s.rr}</div></div>
+      <div class="detail-item"><div class="detail-key">RSI</div><div class="detail-val">${s.rsi}</div></div>
+      <div class="detail-item"><div class="detail-key">ADX</div><div class="detail-val">${s.adx}</div></div>
+      <div class="detail-item"><div class="detail-key">EMA20</div><div class="detail-val">${s.ema20}</div></div>
+      <div class="detail-item"><div class="detail-key">EMA50</div><div class="detail-val">${s.ema50}</div></div>
+      <div class="detail-item"><div class="detail-key">VWAP</div><div class="detail-val">${s.vwap}</div></div>
+      <div class="detail-item"><div class="detail-key">ATR</div><div class="detail-val">${s.atr}</div></div>
+      <div class="detail-item"><div class="detail-key">Supertrend</div><div class="detail-val">${s.supertrend}</div></div>
+      <div class="detail-item"><div class="detail-key">量比</div><div class="detail-val">${s.volRatio}x</div></div>
+      <div class="detail-item"><div class="detail-key">多空評分</div><div class="detail-val">${s.longScore} / ${s.shortScore}</div></div>
+      <div class="detail-item"><div class="detail-key">預測勝率</div><div class="detail-val val-yellow">${s.winrate}%</div></div>
+    </div>
+    ${s.sykes?.score>0?`<div style="margin-top:1rem;padding:.8rem;background:rgba(255,215,0,.05);border:1px solid rgba(255,215,0,.2);border-radius:3px;font-family:var(--mono);font-size:.78rem"><div style="color:var(--yellow);margin-bottom:.4rem">🎯 賽克斯策略：${s.sykes.signal}</div><div style="color:var(--dim)">${s.sykes.detail} · 量比${s.sykes.volMult}x · 當日${s.sykes.dayChange>0?'+':''}${s.sykes.dayChange}%</div></div>`:''}
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem;margin-top:1rem">
+      <button class="scan-btn success" onclick="recordWinFor('${s.symbol}');closeModal('signal-modal')">✅ 記錄獲利</button>
+      <button class="scan-btn danger" onclick="recordLossFor('${s.symbol}');closeModal('signal-modal')">❌ 記錄虧損</button>
+    </div>`;
+  document.getElementById('signal-modal').classList.add('show');
+}
+
+function recordWinFor(sym) { STATE.mlData.samples++; STATE.mlData.wins++; STATE.paperData.pnl+=150; STATE.paperData.wins++; localStorage.setItem('mlData',JSON.stringify(STATE.mlData)); localStorage.setItem('paperData',JSON.stringify(STATE.paperData)); addLog(`${sym} 獲利記錄完成`,'ok'); updateStats(); updateMLDisplay(); }
+function recordLossFor(sym) { STATE.mlData.samples++; STATE.paperData.pnl-=80; STATE.paperData.losses++; localStorage.setItem('mlData',JSON.stringify(STATE.mlData)); localStorage.setItem('paperData',JSON.stringify(STATE.paperData)); addLog(`${sym} 虧損記錄完成`,'warn'); updateStats(); updateMLDisplay(); }
+
+function showMLStatus() {
+  const s=STATE.mlData.samples||0, w=STATE.mlData.wins||0;
+  const wr=s?Math.round(w/s*1000)/10:0;
+  const stage=s<30?'🔵 初期（<30筆）':s<100?'🟡 中期（30~200筆）':'🟢 成熟（>200筆）';
+  document.getElementById('ml-modal-content').innerHTML=`
+    <div style="font-family:var(--mono)">
+      <div style="font-size:.85rem;margin-bottom:1rem">${stage}</div>
+      <div class="detail-grid">
+        <div class="detail-item"><div class="detail-key">總樣本</div><div class="detail-val">${s} 筆</div></div>
+        <div class="detail-item"><div class="detail-key">歷史勝率</div><div class="detail-val val-green">${wr}%</div></div>
+        <div class="detail-item"><div class="detail-key">獲利次數</div><div class="detail-val">${w}</div></div>
+        <div class="detail-item"><div class="detail-key">虧損次數</div><div class="detail-val">${s-w}</div></div>
+      </div>
+      <div style="margin-top:1rem;font-size:.75rem;color:var(--dim);line-height:1.8">
+        <div>• &lt;30筆：固定基準預測，訊號仍可用</div>
+        <div>• 30~200筆：混合歷史勝率和ML預測</div>
+        <div>• &gt;200筆：完全ML預測，最準確</div>
+      </div>
+      ${s>10&&(s-w)>w*2?`<div style="margin-top:1rem;padding:.6rem;background:rgba(255,51,102,.1);border:1px solid rgba(255,51,102,.2);border-radius:3px;font-size:.78rem;color:var(--red)">⚠️ 虧損率過高，建議點擊「重置ML」重新學習</div>`:''}
+    </div>`;
+  document.getElementById('ml-modal').classList.add('show');
+}
+
+function openSettings() { document.getElementById('settings-modal').classList.add('show'); }
+function saveSettings() {
+  STATE.settings.interval=parseInt(document.getElementById('s-interval').value)||5;
+  STATE.settings.minWR=parseInt(document.getElementById('s-minwr').value)||0;
+  localStorage.setItem('settings',JSON.stringify(STATE.settings));
+  closeModal('settings-modal');
+  addLog('設定已儲存','ok');
+}
+function closeModal(id) { document.getElementById(id).classList.remove('show'); }
+function removeSignal(idx) { STATE.signals.splice(idx,1); localStorage.setItem('signals',JSON.stringify(STATE.signals)); renderSignalTable(); }
+
+// ──────────────────────────────────────────────
+// 啟動
+// ──────────────────────────────────────────────
+function init() {
+  updateClock(); setInterval(updateClock,1000);
+  updateMarketPrices(); setInterval(updateMarketPrices,30000);
+  updateFearGreed(); setInterval(updateFearGreed,300000);
+  renderSignalTable();
+  renderSykes();
+  updateStats();
+  updateMLDisplay();
+  addLog('YUAN 加密貨幣分析系統啟動','ok');
+  addLog('OKX API 連線中...','');
+
+  // 點擊 overlay 關閉 modal
+  document.querySelectorAll('.modal-overlay').forEach(el=>{
+    el.addEventListener('click',e=>{if(e.target===el)el.classList.remove('show');});
+  });
+}
+
+init();
+</script>
+</body>
+</html>
