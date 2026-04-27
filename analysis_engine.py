@@ -155,8 +155,10 @@ def get_risk_status() -> dict:
 # ──────────────────────────────────────────────
 _ml = {
     "w":[0.15,0.12,0.18,0.08,0.08,0.10,0.12,0.10,0.05,0.07,0.08,0.05],
-    "b":0.0,   # 修正P1：從-3.5改為0，sigmoid(0)=50%
-    "lr":0.01,"samples":0,
+    "b":0.0,
+    "lr":0.01,
+    "samples":0,
+    "wins":0,   # 新增：記錄獲利次數供混合預測使用
 }
 
 def load_ml_weights():
@@ -166,9 +168,13 @@ def load_ml_weights():
             with open(ML_FILE,"r") as f:
                 saved=json.load(f)
                 _ml.update(saved)
+                # 修正舊版負偏置
                 if _ml.get("b",0)<-1.0:
                     print("[ML] 偵測到舊版負偏置，自動重置為0")
                     _ml["b"]=0.0
+                # 補齊新欄位
+                if "wins" not in _ml:
+                    _ml["wins"]=0
     except Exception: pass
 
 def save_ml_weights():
@@ -181,10 +187,37 @@ def _sigmoid(x:float) -> float:
     except: return 0.5
 
 def ml_predict_winrate(features:list) -> float:
+    """
+    混合勝率預測：
+    - 初期（<50筆）：基準55% + 特徵加成，不被負面數據拖累
+    - 中期（50~200筆）：混合歷史勝率和ML預測
+    - 後期（>200筆）：完全使用ML預測
+    """
+    samples = _ml.get("samples", 0)
+    wins    = _ml.get("wins", 0)
+
+    # 計算 ML 預測
     w=_ml["w"]; b=_ml["b"]
     n=min(len(w),len(features))
     dot=sum(w[i]*features[i] for i in range(n))+b
-    return round(max(45.0,min(95.0,_sigmoid(dot)*100)),1)
+    ml_pred = _sigmoid(dot)*100
+
+    if samples < 50:
+        # 初期：基準55% + 特徵品質加成（不受LOSE拖累）
+        feat_quality = sum(features[:8]) / 8.0   # 特徵品質 0~1
+        base_wr = 50.0 + feat_quality * 20.0      # 50~70%
+        return round(max(45.0, min(85.0, base_wr)), 1)
+
+    elif samples < 200:
+        # 中期：混合歷史勝率和ML預測
+        hist_wr = wins / max(samples, 1) * 100
+        weight  = samples / 200.0   # 0.25~1.0
+        mixed   = hist_wr * weight + ml_pred * (1-weight)
+        return round(max(45.0, min(95.0, mixed)), 1)
+
+    else:
+        # 後期：完全使用ML
+        return round(max(45.0, min(95.0, ml_pred)), 1)
 
 def ml_update(features:list, win:bool):
     y=1.0 if win else 0.0
@@ -195,6 +228,8 @@ def ml_update(features:list, win:bool):
     for i in range(n): w[i]-=lr*err*features[i]
     _ml["b"]-=lr*err
     _ml["samples"]+=1
+    if win:
+        _ml["wins"]=_ml.get("wins",0)+1
     _ml["lr"]=max(0.001,0.01/(1+_ml["samples"]*0.01))
     save_ml_weights()
 
@@ -837,6 +872,11 @@ def _analyze_core(symbol:str, timeframe:str) -> Optional[dict]:
         elif price<e20 and e20<e50: ss+=3
         elif price>e50: ls+=1
         elif price<e50: ss+=1
+
+        # 1b. 短期動量（price vs EMA20，快速基礎分）
+        pct_from_e20 = (price - e20) / max(e20, EPS) * 100
+        if pct_from_e20 > 1.0: ls+=1   # 價格高於EMA20超1%
+        elif pct_from_e20 < -1.0: ss+=1
 
         # 2. Supertrend（趨勢追蹤，權重4）
         if st["direction"]==1: ls+=4

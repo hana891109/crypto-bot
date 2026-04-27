@@ -332,6 +332,34 @@ async def cmd_paper_reset(update:Update, context:ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+async def cmd_reset_ml(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    from analysis_engine import _ml, save_ml_weights
+    _ml["w"]=[0.15,0.12,0.18,0.08,0.08,0.10,0.12,0.10,0.05,0.07,0.08,0.05]
+    _ml["b"]=0.0; _ml["lr"]=0.01; _ml["samples"]=0; _ml["wins"]=0
+    save_ml_weights(); reset_risk_pause()
+    await update.message.reply_text(
+        "🔄 *ML數據已重置！*\n\n"
+        "• ML歸零重新學習\n"
+        "• 風控已解除\n\n"
+        "建議：開啟 /paperon 累積數據",
+        parse_mode="Markdown"
+    )
+async def cmd_ml_status(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    from analysis_engine import _ml
+    samples=_ml.get("samples",0); wins=_ml.get("wins",0)
+    losses=samples-wins; wr=round(wins/max(samples,1)*100,1)
+    if samples<30: stage="🔵 初期（不足30筆）"
+    elif samples<100: stage="🟡 中期（累積中）"
+    else: stage="🟢 成熟（充足）"
+    warn=" ⚠️ 建議 /resetml 重置" if losses>wins*2 and samples>10 else ""
+    await update.message.reply_text(
+        f"🤖 *ML狀態*\n\n"
+        f"  {stage}\n"
+        f"  樣本：`{samples}`筆 勝：`{wins}` 敗：`{losses}`\n"
+        f"  歷史勝率：`{wr}%`{warn}",
+        parse_mode="Markdown"
+    )
+
 # ══════════════════════════════════════════════
 # 背景：自動掃描
 # ══════════════════════════════════════════════
@@ -588,6 +616,8 @@ if __name__ == "__main__":
         ("paperstats",cmd_paper_stats),("paperpos",cmd_paper_positions),
         ("papertf",cmd_paper_tf),("paperlearn",cmd_paper_summary),
         ("paperreset",cmd_paper_reset),
+        ("resetml",   cmd_reset_ml),
+        ("mlstatus",  cmd_ml_status),
     ]:
         app.add_handler(CommandHandler(cmd,fn))
 
