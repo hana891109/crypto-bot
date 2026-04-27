@@ -1042,12 +1042,14 @@ def _analyze_core(symbol:str, timeframe:str) -> Optional[dict]:
             elif candle_adv["pin_bar_bear"] or candle_adv["outside_bar_bear"]: ss+=3
 
         # 16. 趨勢線（PA核心，接近趨勢線 = 關鍵位，權重2）
-        if trendline["near_up_tl"]   and direction=="long":  ls+=2  # 接近上升支撐線
-        if trendline["near_down_tl"] and direction=="short": ss+=2  # 接近下降壓力線
+        #     先用初步方向判斷（ls vs ss）
+        _tmp_dir = "long" if ls >= ss else "short"
+        if trendline["near_up_tl"]   and _tmp_dir == "long":  ls += 2
+        if trendline["near_down_tl"] and _tmp_dir == "short": ss += 2
 
         # 17. 強支撐壓力（PA核心，多次觸碰=越強，權重2）
-        if sr_strength["sup_touches"]>=3 and direction=="long":  ls+=2
-        if sr_strength["res_touches"]>=3 and direction=="short": ss+=2
+        if sr_strength["sup_touches"] >= 3 and _tmp_dir == "long":  ls += 2
+        if sr_strength["res_touches"] >= 3 and _tmp_dir == "short": ss += 2
 
         # ── SMC 次要分析（共30分上限）──
         # SMC 作為進場精確度輔助，不作為主要方向判斷
@@ -1210,6 +1212,9 @@ def _analyze_core(symbol:str, timeframe:str) -> Optional[dict]:
             "near_res":sr_strength["near_res"],
             "dist_near_sup":sr_strength["dist_near_sup"],
             "dist_near_res":sr_strength["dist_near_res"],
+            "trendline_label": str(trendline.get("label","—")),
+            "sr_label":f"支撐{sr_strength['sup_touches']}次/壓力{sr_strength['res_touches']}次",
+            "pa_pattern":str(candle_adv.get("name","—")),
             "ml_features":features,"veto_reasons":veto["reasons"],
         }
 
