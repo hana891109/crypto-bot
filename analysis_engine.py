@@ -64,13 +64,13 @@ OKX_INTERVAL  = {
     "1d":"1D","1w":"1W",
 }
 
-# 動態門檻（優化：降低初始門檻，讓市場有訊號）
+# 動態門檻
 _adaptive_params = {
-    "min_score_diff":2,    # 降低：差距2分即可（原3）
-    "min_score_total":5,   # 降低：總分5即可（原6）
-    "min_adx":8,           # 降低：ADX>8才分析（原12）
-    "min_rr":1.3,          # 降低：風報比1.3即可（原1.5）
-    "vol_threshold":1.2,   # 降低：成交量門檻（原1.3）
+    "min_score_diff":2,
+    "min_score_total":4,   # 4分即可
+    "min_adx":5,           # ADX>5就分析
+    "min_rr":1.0,          # 風報比1.0即可
+    "vol_threshold":1.0,   # 成交量不限
 }
 
 # 訊號品質門檻
@@ -79,7 +79,7 @@ GRADE_B = 70.0
 GRADE_C = 65.0  # 最低門檻
 
 MIN_WINRATE_PCT = GRADE_C
-BTC_CRASH_PCT   = -5.0
+BTC_CRASH_PCT   = -8.0   # 只有BTC單日跌8%才暫停
 FG_ONLY_SHORT   = 90   # 放寬：只有極度貪婪才限制做多
 FG_ONLY_LONG    = 15   # 放寬：只有極度恐懼才限制做空
 
@@ -234,7 +234,7 @@ def is_duplicate_signal(key:str, direction:str, price:float, atr:float) -> bool:
         last = _signal_cache.get(k)
         if last is None:
             _signal_cache[k]=price; return False
-        if abs(price-last)>atr*1.0:   # 放寬：1.0 ATR（原1.5）
+        if abs(price-last)>atr*0.3:   # 極度放寬，幾乎不重複過濾
             _signal_cache[k]=price; return False
     return True
 
@@ -782,23 +782,10 @@ def check_sentiment_filter(direction:str) -> dict:
     return {"blocked":blocked,"fg_value":fg,"label":lbl,"reason":reason}
 
 def check_veto(direction,rsi,macd,macd_sig,hist,adx,funding_rate,market_structure,upper_trend) -> dict:
-    """
-    否決只保留最關鍵的條件，避免過度過濾：
-    - ADX 極弱（<8）才否決，不是 <10
-    - RSI 極端才否決（>85 或 <15），不是 >80
-    - 上層週期反向不再否決（改為評分扣分）
-    - 市場結構衝突僅在明確趨勢時否決
-    """
+    """只否決最極端情況，讓訊號能夠產生"""
     v=[]
-    if adx<8: v.append(f"ADX={adx:.1f}極弱")
-    if direction=="long"  and rsi>85: v.append(f"RSI={rsi}極度超買")
-    if direction=="short" and rsi<15: v.append(f"RSI={rsi}極度超賣")
-    # MACD 三個條件同時成立才否決（更嚴格的標準）
-    if direction=="long"  and macd<macd_sig and hist<0 and macd<0: v.append("MACD空頭排列")
-    if direction=="short" and macd>macd_sig and hist>0 and macd>0: v.append("MACD多頭排列")
-    # 資金費率極端才否決
-    if direction=="long"  and funding_rate>0.5: v.append(f"資金費率{funding_rate}%極度擁擠")
-    if direction=="short" and funding_rate<-0.5: v.append(f"資金費率{funding_rate}%極度擁擠")
+    if direction=="long"  and rsi>90: v.append(f"RSI={rsi}極端超買")
+    if direction=="short" and rsi<10: v.append(f"RSI={rsi}極端超賣")
     return {"vetoed":bool(v),"reasons":v}
 
 def detect_support_resistance(h,l,c,lookback=100,n=3) -> dict:
@@ -1109,9 +1096,9 @@ def _analyze_core(symbol:str, timeframe:str) -> Optional[dict]:
         crash_pct=-3.0 if timeframe in ("5m","15m") else BTC_CRASH_PCT
         if btc_info["btc_change"]<=crash_pct and direction=="long": return None
 
-        # 情緒過濾
+        # 情緒過濾（只記錄，不否決）
         sentiment=check_sentiment_filter(direction)
-        if sentiment["blocked"]: return None
+        # 不再因情緒直接否決，只作為參考資訊顯示
 
         # 多時間框架投票（改為加分制，不直接否決）
         if timeframe not in ("5m","15m"):
@@ -1137,7 +1124,7 @@ def _analyze_core(symbol:str, timeframe:str) -> Optional[dict]:
         atr_sl=(round(best_entry-atr*sl_mult,8) if direction=="long"
                 else round(best_entry+atr*sl_mult,8))
 
-        if exits["risk_reward"]<_adaptive_params["min_rr"]: return None
+        if exits["risk_reward"]<0.8: return None   # 只過濾極端差的風報比
 
         # 防重複
         cache_key=f"{symbol}_{timeframe}"
@@ -1158,11 +1145,10 @@ def _analyze_core(symbol:str, timeframe:str) -> Optional[dict]:
 
         # 勝率門檻（依訓練樣本數動態調整）
         samples = _ml.get("samples", 0)
-        if samples < 20:
-            # ML 訓練樣本不足，降低門檻（讓訊號出來累積數據）
-            min_wr = 50.0 if timeframe in ("5m","15m") else 55.0
-        elif samples < 50:
-            min_wr = 55.0 if timeframe in ("5m","15m") else 60.0
+        if samples < 50:
+            min_wr = 45.0   # 樣本不足時幾乎不過濾，優先累積數據
+        elif samples < 100:
+            min_wr = 55.0
         else:
             min_wr = 60.0 if timeframe in ("5m","15m") else MIN_WINRATE_PCT
         if winrate_pct < min_wr: return None
