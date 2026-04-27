@@ -64,10 +64,13 @@ OKX_INTERVAL  = {
     "1d":"1D","1w":"1W",
 }
 
-# 動態門檻
+# 動態門檻（優化：降低初始門檻，讓市場有訊號）
 _adaptive_params = {
-    "min_score_diff":3,"min_score_total":6,
-    "min_adx":12,"min_rr":1.5,"vol_threshold":1.3,
+    "min_score_diff":2,    # 降低：差距2分即可（原3）
+    "min_score_total":5,   # 降低：總分5即可（原6）
+    "min_adx":8,           # 降低：ADX>8才分析（原12）
+    "min_rr":1.3,          # 降低：風報比1.3即可（原1.5）
+    "vol_threshold":1.2,   # 降低：成交量門檻（原1.3）
 }
 
 # 訊號品質門檻
@@ -77,8 +80,8 @@ GRADE_C = 65.0  # 最低門檻
 
 MIN_WINRATE_PCT = GRADE_C
 BTC_CRASH_PCT   = -5.0
-FG_ONLY_SHORT   = 80
-FG_ONLY_LONG    = 25
+FG_ONLY_SHORT   = 90   # 放寬：只有極度貪婪才限制做多
+FG_ONLY_LONG    = 15   # 放寬：只有極度恐懼才限制做空
 
 _parallel_mode = False
 _signal_cache: dict = {}
@@ -231,7 +234,7 @@ def is_duplicate_signal(key:str, direction:str, price:float, atr:float) -> bool:
         last = _signal_cache.get(k)
         if last is None:
             _signal_cache[k]=price; return False
-        if abs(price-last)>atr*1.5:
+        if abs(price-last)>atr*1.0:   # 放寬：1.0 ATR（原1.5）
             _signal_cache[k]=price; return False
     return True
 
@@ -779,18 +782,23 @@ def check_sentiment_filter(direction:str) -> dict:
     return {"blocked":blocked,"fg_value":fg,"label":lbl,"reason":reason}
 
 def check_veto(direction,rsi,macd,macd_sig,hist,adx,funding_rate,market_structure,upper_trend) -> dict:
+    """
+    否決只保留最關鍵的條件，避免過度過濾：
+    - ADX 極弱（<8）才否決，不是 <10
+    - RSI 極端才否決（>85 或 <15），不是 >80
+    - 上層週期反向不再否決（改為評分扣分）
+    - 市場結構衝突僅在明確趨勢時否決
+    """
     v=[]
-    if adx<10: v.append(f"ADX={adx:.1f}極弱")
-    if direction=="long"  and rsi>80: v.append(f"RSI={rsi}嚴重超買")
-    if direction=="short" and rsi<20: v.append(f"RSI={rsi}嚴重超賣")
+    if adx<8: v.append(f"ADX={adx:.1f}極弱")
+    if direction=="long"  and rsi>85: v.append(f"RSI={rsi}極度超買")
+    if direction=="short" and rsi<15: v.append(f"RSI={rsi}極度超賣")
+    # MACD 三個條件同時成立才否決（更嚴格的標準）
     if direction=="long"  and macd<macd_sig and hist<0 and macd<0: v.append("MACD空頭排列")
     if direction=="short" and macd>macd_sig and hist>0 and macd>0: v.append("MACD多頭排列")
-    if direction=="long"  and market_structure=="trending_down": v.append("市場結構空頭")
-    if direction=="short" and market_structure=="trending_up": v.append("市場結構多頭")
-    if upper_trend=="down" and direction=="long": v.append("上層週期空頭")
-    if upper_trend=="up"   and direction=="short": v.append("上層週期多頭")
-    if direction=="long"  and funding_rate>0.3: v.append(f"資金費率{funding_rate}%多方擁擠")
-    if direction=="short" and funding_rate<-0.3: v.append(f"資金費率{funding_rate}%空方擁擠")
+    # 資金費率極端才否決
+    if direction=="long"  and funding_rate>0.5: v.append(f"資金費率{funding_rate}%極度擁擠")
+    if direction=="short" and funding_rate<-0.5: v.append(f"資金費率{funding_rate}%極度擁擠")
     return {"vetoed":bool(v),"reasons":v}
 
 def detect_support_resistance(h,l,c,lookback=100,n=3) -> dict:
@@ -1105,12 +1113,16 @@ def _analyze_core(symbol:str, timeframe:str) -> Optional[dict]:
         sentiment=check_sentiment_filter(direction)
         if sentiment["blocked"]: return None
 
-        # 多時間框架投票（短線跳過）
+        # 多時間框架投票（改為加分制，不直接否決）
         if timeframe not in ("5m","15m"):
             mtf=multi_timeframe_vote(symbol,timeframe,direction)
-            if not mtf["passed"]: return None
             mtf_label=mtf["label"]
+            # 通過加2分，未通過不否決但不加分
+            if mtf["passed"]:
+                if direction=="long": ls+=2
+                else: ss+=2
         else:
+            mtf={"passed":True,"votes":1,"total":1}
             mtf_label="短線（跳過）"
 
         # 鯨魚加分
@@ -1144,9 +1156,16 @@ def _analyze_core(symbol:str, timeframe:str) -> Optional[dict]:
                                    hv_,hc_,ua,hbo,itr,rsi,direction,hist,macd,ms,hd,tf_weight)
         winrate_pct=ml_predict_winrate(features)
 
-        # 勝率門檻（短線稍低）
-        min_wr=60.0 if timeframe in ("5m","15m") else MIN_WINRATE_PCT
-        if winrate_pct<min_wr: return None
+        # 勝率門檻（依訓練樣本數動態調整）
+        samples = _ml.get("samples", 0)
+        if samples < 20:
+            # ML 訓練樣本不足，降低門檻（讓訊號出來累積數據）
+            min_wr = 50.0 if timeframe in ("5m","15m") else 55.0
+        elif samples < 50:
+            min_wr = 55.0 if timeframe in ("5m","15m") else 60.0
+        else:
+            min_wr = 60.0 if timeframe in ("5m","15m") else MIN_WINRATE_PCT
+        if winrate_pct < min_wr: return None
 
         # 訊號品質等級
         if winrate_pct>=GRADE_A: grade="🏆 A級"
