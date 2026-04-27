@@ -147,14 +147,21 @@ def get_risk_status() -> dict:
 # ──────────────────────────────────────────────
 _ml = {
     "w":[0.15,0.12,0.18,0.08,0.08,0.10,0.12,0.10,0.05,0.07,0.08,0.05],
-    "b":-3.5,"lr":0.01,"samples":0,
+    "b":0.0,    # 修正：從-3.5改為0（中性起點，sigmoid(0)=50%）
+    "lr":0.01,"samples":0,
 }
 
 def load_ml_weights():
     global _ml
     try:
         if os.path.exists(ML_FILE):
-            with open(ML_FILE,"r") as f: _ml.update(json.load(f))
+            with open(ML_FILE,"r") as f:
+                saved = json.load(f)
+                _ml.update(saved)
+                # 修正：如果舊版本的偏置是負數，重置為中性
+                if _ml.get("b", 0) < -1.0:
+                    print("[ML] 偵測到舊版偏置，自動重置為中性")
+                    _ml["b"] = 0.0
     except Exception: pass
 
 def save_ml_weights():
@@ -170,7 +177,7 @@ def ml_predict_winrate(features:list) -> float:
     w=_ml["w"]; b=_ml["b"]
     n=min(len(w),len(features))
     dot=sum(w[i]*features[i] for i in range(n))+b
-    return round(max(35.0,min(95.0,_sigmoid(dot)*100)),1)
+    return round(max(45.0,min(95.0,_sigmoid(dot)*100)),1)
 
 def ml_update(features:list, win:bool):
     y=1.0 if win else 0.0
@@ -1145,13 +1152,13 @@ def _analyze_core(symbol:str, timeframe:str) -> Optional[dict]:
 
         # 勝率門檻（依訓練樣本數動態調整）
         samples = _ml.get("samples", 0)
-        if samples < 50:
-            min_wr = 45.0   # 樣本不足時幾乎不過濾，優先累積數據
+        if samples < 30:
+            pass   # 樣本不足時完全跳過ML過濾，優先累積數據
         elif samples < 100:
-            min_wr = 55.0
+            if winrate_pct < 55.0: return None
         else:
             min_wr = 60.0 if timeframe in ("5m","15m") else MIN_WINRATE_PCT
-        if winrate_pct < min_wr: return None
+            if winrate_pct < min_wr: return None
 
         # 訊號品質等級
         if winrate_pct>=GRADE_A: grade="🏆 A級"
